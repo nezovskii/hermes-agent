@@ -79,6 +79,7 @@ CONFIGURABLE_TOOLSETS = [
     ("discord",         "💬 Discord (read/participate)", "fetch messages, search members, create thread"),
     ("discord_admin",   "🛡️  Discord Server Admin",    "list channels/roles, pin, assign roles"),
     ("yuanbao",          "🤖 Yuanbao",                  "group info, member queries, DM"),
+    ("nia",              "🧭 Nia Retrieval",             "external repo/docs/source search"),
     ("computer_use",     "🖱️  Computer Use (macOS)",     "background desktop control via cua-driver"),
 ]
 
@@ -96,7 +97,10 @@ CONFIGURABLE_TOOLSETS = [
 # `hermes tools` → X (Twitter) Search setup walks users through credential
 # setup. The tool's check_fn means the schema still won't appear to the
 # model if the credential later goes missing or expires.
-_DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search"}
+#
+# Nia is off by default because it depends on external retrieval credentials
+# and can add broad source-search capabilities users should opt into.
+_DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "nia"}
 
 
 def _xai_credentials_present() -> bool:
