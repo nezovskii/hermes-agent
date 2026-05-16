@@ -255,6 +255,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "nia": {
+        "description": "Nia external retrieval/search tools for indexed repositories, documentation sources, web, and deep research",
+        "tools": ["nia_usage", "nia_repos", "nia_sources", "nia_search"],
+        "includes": []
+    },
+
     "kanban": {
         "description": (
             "Kanban multi-agent coordination — only active when the agent "
