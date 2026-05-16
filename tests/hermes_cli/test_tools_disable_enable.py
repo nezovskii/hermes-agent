@@ -23,6 +23,31 @@ class TestToolsDisableBuiltin:
 # ── Built-in toolset enable ─────────────────────────────────────────────────
 
 
+class TestToolsEnableBuiltin:
+
+    def test_enable_adds_toolset_to_platform(self):
+        config = {"platform_toolsets": {"cli": ["memory"]}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save:
+            tools_disable_enable_command(Namespace(tools_action="enable", names=["web"], platform="cli"))
+        saved = mock_save.call_args[0][0]
+        assert "web" in saved["platform_toolsets"]["cli"]
+
+    def test_enable_nia_toolset_to_platform(self):
+        config = {"platform_toolsets": {"telegram": ["hermes-gateway"]}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save:
+            tools_disable_enable_command(Namespace(tools_action="enable", names=["nia"], platform="telegram"))
+        saved = mock_save.call_args[0][0]
+        assert "nia" in saved["platform_toolsets"]["telegram"]
+
+    def test_enable_already_present_is_idempotent(self):
+        config = {"platform_toolsets": {"cli": ["web"]}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save:
+            tools_disable_enable_command(Namespace(tools_action="enable", names=["web"], platform="cli"))
+        saved = mock_save.call_args[0][0]
+        assert saved["platform_toolsets"]["cli"].count("web") == 1
 # ── MCP tool disable ────────────────────────────────────────────────────────
 
 
