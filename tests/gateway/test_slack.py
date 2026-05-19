@@ -1330,6 +1330,51 @@ class TestIncomingDocumentHandling:
         assert "can you parse this" in msg_event.text
 
     @pytest.mark.asyncio
+    async def test_slack_audio_mp4_uses_m4a_extension_for_transcription(self, adapter):
+        """Slack voice notes often arrive as audio/mp4; cache them as .m4a, not mislabeled .ogg."""
+        with patch.object(adapter, "_download_slack_file", new_callable=AsyncMock) as dl:
+            dl.return_value = "/tmp/hermes-audio/voice.m4a"
+            event = self._make_event(files=[{
+                "mimetype": "audio/mp4",
+                "name": "voice-message.m4a",
+                "url_private_download": "https://files.slack.com/voice",
+                "size": 1234,
+            }], text="")
+            await adapter._handle_slack_message(event)
+
+        dl.assert_awaited_once()
+        assert dl.await_args is not None
+        args = dl.await_args.args
+        kwargs = dl.await_args.kwargs
+        assert args[1] == ".m4a"
+        assert kwargs["audio"] is True
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.VOICE
+        assert msg_event.media_types == ["audio/mp4"]
+        assert msg_event.media_urls == ["/tmp/hermes-audio/voice.m4a"]
+
+    @pytest.mark.asyncio
+    async def test_slack_audio_mpeg_uses_mp3_extension_for_transcription(self, adapter):
+        """audio/mpeg should be cached as .mp3 so STT providers recognize it."""
+        with patch.object(adapter, "_download_slack_file", new_callable=AsyncMock) as dl:
+            dl.return_value = "/tmp/hermes-audio/voice.mp3"
+            event = self._make_event(files=[{
+                "mimetype": "audio/mpeg",
+                "name": "voice-message",
+                "url_private_download": "https://files.slack.com/voice",
+                "size": 1234,
+            }], text="")
+            await adapter._handle_slack_message(event)
+
+        dl.assert_awaited_once()
+        assert dl.await_args is not None
+        args = dl.await_args.args
+        assert args[1] == ".mp3"
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.VOICE
+        assert msg_event.media_types == ["audio/mpeg"]
+
+    @pytest.mark.asyncio
     async def test_large_txt_not_injected(self, adapter):
         """A .txt file over 100KB should be cached but NOT injected."""
         content = b"x" * (200 * 1024)
