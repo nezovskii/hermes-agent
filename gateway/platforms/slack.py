@@ -52,6 +52,48 @@ from gateway.platforms.base import (
 
 logger = logging.getLogger(__name__)
 
+_SUPPORTED_SLACK_AUDIO_EXTENSIONS = {".ogg", ".oga", ".opus", ".mp3", ".wav", ".webm", ".m4a", ".mp4", ".aac", ".flac"}
+_SLACK_AUDIO_MIME_EXTENSIONS = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/aac": ".aac",
+    "audio/x-aac": ".aac",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/webm": ".webm",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/flac": ".flac",
+    "audio/x-flac": ".flac",
+}
+
+
+def _slack_audio_extension(mimetype: str, filename: str = "") -> str:
+    """Return an STT-friendly extension for Slack audio downloads.
+
+    Slack voice/audio files can arrive as ``audio/mp4`` or ``audio/mpeg``.
+    The old fallback converted unknown audio subtypes to ``.ogg`` even when the
+    bytes were MP4/MP3, which makes downstream STT providers treat valid audio
+    as corrupted or unsupported.
+    """
+    if filename:
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in _SUPPORTED_SLACK_AUDIO_EXTENSIONS:
+            # Prefer .m4a for MP4 audio because STT APIs recognize it as audio;
+            # a bare .mp4 extension is often treated as video.
+            return ".m4a" if ext == ".mp4" and mimetype.split(";", 1)[0].lower() == "audio/mp4" else ext
+
+    normalized = (mimetype or "").split(";", 1)[0].strip().lower()
+    if normalized in _SLACK_AUDIO_MIME_EXTENSIONS:
+        return _SLACK_AUDIO_MIME_EXTENSIONS[normalized]
+
+    ext = "." + normalized.split("/", 1)[-1] if "/" in normalized else ""
+    if ext in _SUPPORTED_SLACK_AUDIO_EXTENSIONS:
+        return ext
+    return ".ogg"
+
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
 # stashed response_url when multiple users issue commands on the same
@@ -2089,9 +2131,8 @@ class SlackAdapter(BasePlatformAdapter):
                         logger.warning("[Slack] Failed to cache image from %s: %s", url, e, exc_info=True)
             elif mimetype.startswith("audio/") and url:
                 try:
-                    ext = "." + mimetype.split("/")[-1].split(";")[0]
-                    if ext not in {".ogg", ".mp3", ".wav", ".webm", ".m4a"}:
-                        ext = ".ogg"
+                    original_filename = f.get("name", "")
+                    ext = _slack_audio_extension(mimetype, original_filename)
                     cached = await self._download_slack_file(url, ext, audio=True, team_id=team_id)
                     media_urls.append(cached)
                     media_types.append(mimetype)
