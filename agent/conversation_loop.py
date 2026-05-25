@@ -2497,6 +2497,36 @@ def run_conversation(
                     if agent._try_refresh_copilot_client_credentials():
                         agent._buffer_vprint(f"🔐 Copilot credentials refreshed after 401. Retrying request...")
                         continue
+
+                # Fast failover for provider-capacity/transport failures.
+                # A 300s Codex stale-call timeout has already burned enough
+                # wall-clock. Retrying the same stuck backend before trying a
+                # configured fallback turns one outage into a 5–15 minute
+                # user-visible stall. Auth/context/payload errors still go
+                # through their dedicated recovery branches above/below.
+                _eager_fallback_reasons = {
+                    FailoverReason.timeout,
+                    FailoverReason.server_error,
+                    FailoverReason.overloaded,
+                    FailoverReason.rate_limit,
+                    FailoverReason.billing,
+                }
+                _should_eager_fallback = (
+                    (classified.should_fallback or classified.reason in _eager_fallback_reasons)
+                    and not classified.should_compress
+                    and classified.reason not in {FailoverReason.auth, FailoverReason.auth_permanent}
+                    and agent._fallback_index < len(agent._fallback_chain)
+                )
+                if _should_eager_fallback:
+                    agent._emit_status(
+                        f"⚠️ {classified.reason.value} on {agent.provider} — switching to fallback..."
+                    )
+                    if agent._try_activate_fallback(classified.reason):
+                        retry_count = 0
+                        compression_attempts = 0
+                        primary_recovery_attempted = False
+                        continue
+
                 if (
                     agent.api_mode == "anthropic_messages"
                     and status_code == 401
