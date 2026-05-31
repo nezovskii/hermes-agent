@@ -1090,7 +1090,6 @@ def skill_view(
                 if fm.get("name") == name:
                     _record(found_skill_md.parent, found_skill_md)
 
-            # Strategy 3: legacy flat <name>.md files anywhere under the dir.
             # Exclude skill support docs: references/templates/assets/scripts
             # are loaded through skill_view(skill, file_path=...) and must not
             # shadow or collide with real skills that share the same basename.
