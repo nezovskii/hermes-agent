@@ -982,9 +982,20 @@ def skill_view(
                     _record(found_skill_md.parent, found_skill_md)
 
             # Strategy 3: legacy flat <name>.md files anywhere under the dir.
+            # Do not treat linked skill support files as standalone skills: a
+            # skill may legitimately ship templates/notion.md or
+            # references/styles/notion.md, and those must not collide with an
+            # actual notion/SKILL.md skill.
             for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md":
-                    _record(None, found_md)
+                if found_md.name == "SKILL.md":
+                    continue
+                try:
+                    rel_parts = found_md.relative_to(search_dir).parts
+                except ValueError:
+                    rel_parts = found_md.parts
+                if any(part in {"templates", "references", "assets", "scripts"} for part in rel_parts[:-1]):
+                    continue
+                _record(None, found_md)
 
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
