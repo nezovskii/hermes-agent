@@ -87,6 +87,14 @@ def sanitize_gemini_schema(schema: Any) -> Dict[str, Any]:
         if any(not isinstance(item, str) for item in enum_val):
             cleaned.pop("enum", None)
 
+    # Gemini rejects array schemas without an explicit ``items`` schema:
+    # ``...properties[foo].items: missing field``.  OpenAI-style tool schemas
+    # from MCP/Pydantic sometimes emit ``{"type": "array"}`` for loosely typed
+    # lists (for example GBrain's ``pages_updated`` ingestion field).  Preserve
+    # the permissive intent by adding an unconstrained object item schema.
+    if type_val == "array" and not isinstance(cleaned.get("items"), dict):
+        cleaned["items"] = {"type": "object", "properties": {}}
+
     return cleaned
 
 
