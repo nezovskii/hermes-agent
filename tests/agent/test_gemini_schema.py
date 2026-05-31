@@ -102,6 +102,20 @@ class TestSanitizeGeminiSchema:
         assert cleaned["items"]["type"] == "integer"
         assert "enum" not in cleaned["items"]
 
+    def test_adds_items_for_bare_array_schema(self):
+        """Gemini rejects ``type: array`` without an explicit ``items`` field."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "pages_updated": {"type": "array"},
+            },
+        }
+        cleaned = sanitize_gemini_schema(schema)
+        assert cleaned["properties"]["pages_updated"] == {
+            "type": "array",
+            "items": {"type": "object", "properties": {}},
+        }
+
     def test_non_dict_input_returns_empty(self):
         assert sanitize_gemini_schema(None) == {}
         assert sanitize_gemini_schema("not a schema") == {}
