@@ -221,6 +221,29 @@ class TestSkillViewQualifiedName:
         assert result["success"] is True
         assert result["name"] == "my-local"
 
+    def test_support_files_do_not_collide_with_skill_name(self, tmp_path, monkeypatch):
+        from tools.skills_tool import skill_view
+
+        local_skills = tmp_path / "local-skills"
+        skill_dir = local_skills / "productivity" / "notion"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: notion\ndescription: Notion API\n---\nReal Notion skill.\n"
+        )
+        template = local_skills / "creative" / "popular-web-designs" / "templates" / "notion.md"
+        template.parent.mkdir(parents=True)
+        template.write_text("# Notion design template\n")
+        reference = local_skills / "creative" / "baoyu" / "references" / "styles" / "notion.md"
+        reference.parent.mkdir(parents=True)
+        reference.write_text("# Notion style reference\n")
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", local_skills)
+
+        result = json.loads(skill_view("notion"))
+
+        assert result["success"] is True
+        assert result["name"] == "notion"
+        assert "Real Notion skill." in result["content"]
+
     def test_plugin_exists_but_skill_missing(self, tmp_path):
         from tools.skills_tool import skill_view
 
