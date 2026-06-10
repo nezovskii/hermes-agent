@@ -131,6 +131,28 @@ def test_source_read_preserves_content(monkeypatch, tmp_path):
     assert captured["url"] == "https://apigcp.trynia.ai/v2/sources/src123/content?path=docs%2Findex.md&line_start=1&line_end=5"
 
 
+def test_source_read_pdf_page(monkeypatch, tmp_path):
+    nia = reload_nia(monkeypatch, tmp_path)
+    captured = capture_request(monkeypatch, b'{"content":"page text"}')
+
+    result = decode_result(nia.nia_sources_tool({"action": "read", "source_id": "paper123", "page": 2, "max_length": 5000}))
+
+    assert result == {"content": "page text"}
+    assert captured["method"] == "GET"
+    assert captured["url"] == "https://apigcp.trynia.ai/v2/sources/paper123/content?page=2&max_length=5000"
+
+
+def test_source_read_pdf_tree_node(monkeypatch, tmp_path):
+    nia = reload_nia(monkeypatch, tmp_path)
+    captured = capture_request(monkeypatch, b'{"content":"section text"}')
+
+    result = decode_result(nia.nia_sources_tool({"action": "read", "source_id": "paper123", "tree_node_id": "0008"}))
+
+    assert result == {"content": "section text"}
+    assert captured["method"] == "GET"
+    assert captured["url"] == "https://apigcp.trynia.ai/v2/sources/paper123/content?tree_node_id=0008"
+
+
 def test_search_web_body(monkeypatch, tmp_path):
     nia = reload_nia(monkeypatch, tmp_path)
     captured = capture_request(monkeypatch, b'{"results":[]}')
@@ -163,4 +185,74 @@ def test_toolset_contains_nia_tools():
 
     assert "nia" in toolsets.TOOLSETS
     resolved = set(toolsets.resolve_toolset("nia"))
-    assert {"nia_usage", "nia_repos", "nia_sources", "nia_search"}.issubset(resolved)
+    assert {"nia_usage", "nia_repos", "nia_sources", "nia_context", "nia_search"}.issubset(resolved)
+
+
+def test_nia_sources_index_arxiv_defaults_to_research_paper(monkeypatch, tmp_path):
+    nia = reload_nia(monkeypatch, tmp_path)
+    captured = capture_request(monkeypatch, b'{"id":"src_1","status":"completed"}')
+
+    result = decode_result(
+        nia.nia_sources_tool({"action": "index", "url": "https://arxiv.org/pdf/2601.10547", "display_name": "paper"})
+    )
+    body = json.loads(captured["data"].decode())
+
+    assert result["id"] == "src_1"
+    assert body["type"] == "research_paper"
+    assert body["url"] == "https://arxiv.org/pdf/2601.10547"
+
+
+def test_nia_sources_index_local_file_uploads_then_creates_source(monkeypatch, tmp_path):
+    nia = reload_nia(monkeypatch, tmp_path)
+    pdf = tmp_path / "book.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    captured = capture_request(monkeypatch, b'{"id":"src_pdf","status":"indexing"}')
+
+    monkeypatch.setattr(nia, "_upload_local_file_to_nia", lambda path: {
+        "gcs_path": "gs://bucket/book.pdf",
+        "content_type": "application/pdf",
+        "filename": "book.pdf",
+    })
+
+    result = decode_result(nia.nia_sources_tool({"action": "index", "local_path": str(pdf)}))
+    body = json.loads(captured["data"].decode())
+
+    assert result["id"] == "src_pdf"
+    assert body["type"] == "documentation"
+    assert body["gcs_path"] == "gs://bucket/book.pdf"
+    assert body["is_pdf"] is True
+    assert body["display_name"] == "book.pdf"
+
+
+def test_nia_context_save_builds_cross_agent_payload(monkeypatch, tmp_path):
+    nia = reload_nia(monkeypatch, tmp_path)
+    captured = capture_request(monkeypatch, b'{"id":"ctx_1"}')
+
+    result = decode_result(nia.nia_context_tool({
+        "action": "save",
+        "title": "OpenJarvis intake invariant",
+        "summary": "Use NIA as source layer and GBrain as decision layer.",
+        "content": "When ingesting long arXiv/PDF sources, index the source in NIA first, then save routed decisions and deltas into Private GBrain for durable retrieval.",
+        "tags": "nezovskiios,openjarvis,nia",
+        "memory_type": "procedural",
+    }))
+    body = json.loads(captured["data"].decode())
+
+    assert result["id"] == "ctx_1"
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://apigcp.trynia.ai/v2/contexts"
+    assert body["agent_source"] == "hermes-centurio"
+    assert body["tags"] == ["nezovskiios", "openjarvis", "nia"]
+    assert body["memory_type"] == "procedural"
+
+
+def test_nia_context_search_uses_semantic_endpoint(monkeypatch, tmp_path):
+    nia = reload_nia(monkeypatch, tmp_path)
+    captured = capture_request(monkeypatch, b'{"results":[]}')
+
+    result = decode_result(nia.nia_context_tool({"action": "search", "query": "OpenJarvis", "limit": 3}))
+
+    assert result == {"results": []}
+    assert captured["method"] == "GET"
+    assert captured["url"] == "https://apigcp.trynia.ai/v2/contexts/semantic-search?q=OpenJarvis&limit=3"
+
