@@ -78,6 +78,9 @@ async def test_voice_message_still_transcribed():
     # The transcript passes through as a plain quoted line — no "voice message"
     # meta-commentary in the LLM-visible prompt.
     assert "hello world" in result
+    assert "voice_message_transcript" in result
+    assert "Here's what they said" not in result
+    assert "do_not_echo" in result
 
 
 # ---------------------------------------------------------------------------
