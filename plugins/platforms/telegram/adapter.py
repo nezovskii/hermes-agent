@@ -529,6 +529,13 @@ class TelegramAdapter(BasePlatformAdapter):
         self._media_batch_delay_seconds = env_float("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", 0.8)
         self._pending_photo_batches: Dict[str, MessageEvent] = {}
         self._pending_photo_batch_tasks: Dict[str, asyncio.Task] = {}
+        # Optional document burst batching for workflows where users upload many
+        # PDFs/files back-to-back (labs, books, trading exports). Kept opt-in so
+        # single document uploads retain the historical immediate path unless a
+        # profile explicitly enables batching.
+        self._document_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_DOCUMENT_BATCH_DELAY_SECONDS", "0"))
+        self._pending_document_batches: Dict[str, MessageEvent] = {}
+        self._pending_document_batch_tasks: Dict[str, asyncio.Task] = {}
         self._media_group_events: Dict[str, MessageEvent] = {}
         self._media_group_tasks: Dict[str, asyncio.Task] = {}
         # Buffer rapid text messages so Telegram client-side splits of long
@@ -3370,6 +3377,8 @@ class TelegramAdapter(BasePlatformAdapter):
             collect(task)
         for task in list(self._pending_photo_batch_tasks.values()):
             collect(task)
+        for task in list(getattr(self, "_pending_document_batch_tasks", {}).values()):
+            collect(task)
         for task in list(self._pending_text_batch_tasks.values()):
             collect(task)
         collect(self._polling_error_task)
@@ -3383,6 +3392,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._media_group_events.clear()
         self._pending_photo_batch_tasks.clear()
         self._pending_photo_batches.clear()
+        if hasattr(self, "_pending_document_batch_tasks"):
+            self._pending_document_batch_tasks.clear()
+        if hasattr(self, "_pending_document_batches"):
+            self._pending_document_batches.clear()
         self._pending_text_batch_tasks.clear()
         self._pending_text_batches.clear()
         if self._polling_error_task is not current_task:
@@ -3452,6 +3465,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, _redact_telegram_error_text(e),
                 )
         self._release_platform_lock()
+
 
         self._app = None
         self._bot = None
@@ -7618,6 +7632,47 @@ class TelegramAdapter(BasePlatformAdapter):
 
         self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(self._flush_photo_batch(batch_key))
 
+    def _document_batch_key(self, event: MessageEvent) -> str:
+        """Return a batching key for rapid non-album Telegram documents."""
+        from gateway.session import build_session_key
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        return f"{session_key}:document-burst"
+
+    async def _flush_document_batch(self, batch_key: str) -> None:
+        """Send a buffered document burst as a single MessageEvent."""
+        current_task = asyncio.current_task()
+        try:
+            await asyncio.sleep(self._document_batch_delay_seconds)
+            event = self._pending_document_batches.pop(batch_key, None)
+            if not event:
+                return
+            logger.info("[Telegram] Flushing document batch %s with %d file(s)", batch_key, len(event.media_urls))
+            await self.handle_message(event)
+        finally:
+            if self._pending_document_batch_tasks.get(batch_key) is current_task:
+                self._pending_document_batch_tasks.pop(batch_key, None)
+
+    def _enqueue_document_event(self, batch_key: str, event: MessageEvent) -> None:
+        """Merge document events into a pending batch and schedule flush."""
+        existing = self._pending_document_batches.get(batch_key)
+        if existing is None:
+            self._pending_document_batches[batch_key] = event
+        else:
+            existing.media_urls.extend(event.media_urls)
+            existing.media_types.extend(event.media_types)
+            if event.text:
+                existing.text = self._merge_caption(existing.text, event.text)
+
+        prior_task = self._pending_document_batch_tasks.get(batch_key)
+        if prior_task and not prior_task.done():
+            prior_task.cancel()
+
+        self._pending_document_batch_tasks[batch_key] = asyncio.create_task(self._flush_document_batch(batch_key))
+
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
@@ -7895,6 +7950,14 @@ class TelegramAdapter(BasePlatformAdapter):
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
             await self._queue_media_group_event(str(media_group_id), event)
+            return
+
+        if (
+            msg_type == MessageType.DOCUMENT
+            and event.media_urls
+            and self._document_batch_delay_seconds > 0
+        ):
+            self._enqueue_document_event(self._document_batch_key(event), event)
             return
 
         await self.handle_message(event)

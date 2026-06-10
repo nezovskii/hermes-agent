@@ -262,6 +262,28 @@ class TestDocumentDownloadBlock:
         assert event.media_types == ["application/zip"]
 
     @pytest.mark.asyncio
+    async def test_document_burst_is_buffered_and_combined_when_enabled(self, adapter):
+        adapter._document_batch_delay_seconds = 0.01
+        first = _make_document(file_name="first.pdf", mime_type="application/pdf", file_size=100, file_obj=_make_file_obj(b"first"))
+        second = _make_document(file_name="second.pdf", mime_type="application/pdf", file_size=100, file_obj=_make_file_obj(b"second"))
+        msg1 = _make_message(document=first, caption="process these")
+        msg2 = _make_message(document=second)
+
+        await adapter._handle_media_message(_make_update(msg1), MagicMock())
+        await adapter._handle_media_message(_make_update(msg2), MagicMock())
+        assert adapter.handle_message.await_count == 0
+
+        await asyncio.sleep(adapter._document_batch_delay_seconds + 0.05)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "process these"
+        assert len(event.media_urls) == 2
+        assert event.media_urls[0].endswith("first.pdf")
+        assert event.media_urls[1].endswith("second.pdf")
+        assert event.media_types == ["application/pdf", "application/pdf"]
+
+    @pytest.mark.asyncio
     async def test_png_document_is_routed_as_image(self, adapter):
         """Telegram documents that are really PNGs should use the image path."""
         file_obj = _make_file_obj(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
