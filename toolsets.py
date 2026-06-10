@@ -259,7 +259,7 @@ TOOLSETS = {
 
     "nia": {
         "description": "Nia external retrieval/search tools for indexed repositories, documentation sources, web, and deep research",
-        "tools": ["nia_usage", "nia_repos", "nia_sources", "nia_search"],
+        "tools": ["nia_usage", "nia_repos", "nia_sources", "nia_context", "nia_search"],
         "includes": []
     },
 
