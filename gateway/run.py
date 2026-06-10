@@ -13993,12 +13993,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if result["success"]:
                     transcript = result["transcript"]
                     successful_transcripts.append(transcript)
-                    # Pass the transcript through as a plain quoted line. The
-                    # earlier wording ("The user sent a voice message~ Here's
-                    # what they said: ...") read as a meta-instruction and made
-                    # the LLM volunteer commentary about voice mode rather than
-                    # reply to the content.
-                    enriched_parts.append(f'"{transcript}"')
+                    enriched_parts.append(
+                        "<voice_message_transcript internal=\"true\" do_not_echo=\"true\">\n"
+                        "The user sent a voice message. Use this transcript only to understand "
+                        "and answer the user's intent. Do not quote, repeat, summarize, or mention "
+                        "the transcript/wrapper unless the user explicitly asks for the transcript.\n"
+                        f"{transcript}\n"
+                        "</voice_message_transcript>"
+                    )
                 else:
                     error = result.get("error", "unknown error")
                     # All failure branches: a single, minimal, neutral marker.
