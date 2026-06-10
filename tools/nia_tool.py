@@ -9,6 +9,7 @@ included in returned errors.
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import re
 import urllib.error
@@ -109,6 +110,41 @@ def _request(method: str, path: str, body: Optional[Dict[str, Any]] = None) -> A
         return {"error": _redact(msg), "http_status": exc.code}
     except Exception as exc:  # pragma: no cover - defensive around network stack
         return {"error": _redact(f"Nia request failed: {type(exc).__name__}: {exc}")}
+
+
+def _upload_local_file_to_nia(path: str) -> Dict[str, Any]:
+    """Upload a local PDF/spreadsheet to Nia and return the GCS path payload."""
+    file_path = Path(path).expanduser()
+    if not file_path.exists() or not file_path.is_file():
+        return {"error": f"Local file not found: {file_path}"}
+
+    content_type = mimetypes.guess_type(str(file_path))[0] or "application/pdf"
+    upload_info = _request(
+        "POST",
+        "/sources/upload-url",
+        {"filename": file_path.name, "content_type": content_type},
+    )
+    if not isinstance(upload_info, dict) or upload_info.get("error"):
+        return upload_info if isinstance(upload_info, dict) else {"error": "Invalid Nia upload-url response"}
+
+    upload_url = upload_info.get("upload_url")
+    gcs_path = upload_info.get("gcs_path")
+    if not upload_url or not gcs_path:
+        return {"error": "Nia upload-url response missing upload_url or gcs_path"}
+
+    req = urllib.request.Request(
+        upload_url,
+        data=file_path.read_bytes(),
+        headers={"Content-Type": content_type},
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_TIMEOUT_SECONDS) as resp:
+            resp.read()
+    except Exception as exc:  # pragma: no cover - network/storage defensive path
+        return {"error": _redact(f"Nia file upload failed: {type(exc).__name__}: {exc}")}
+
+    return {"gcs_path": gcs_path, "content_type": content_type, "filename": file_path.name}
 
 
 def _bool_arg(args: Dict[str, Any], name: str) -> Optional[bool]:
@@ -217,21 +253,35 @@ def nia_repos_tool(args: Dict[str, Any], **kw) -> str:
 def nia_sources_tool(args: Dict[str, Any], **kw) -> str:
     action = str(args.get("action", "list")).strip().lower()
     source_id = str(args.get("source_id") or args.get("identifier") or "").strip()
-    source_type = args.get("type")
+    source_type = args.get("source_type") or args.get("type")
 
     if action == "list":
         qs = _query({"type": source_type})
         return _json(_request("GET", "/sources" + (f"?{qs}" if qs else "")))
     if action == "index":
         url = str(args.get("url", "")).strip()
-        if not url:
-            return _error("url is required for action=index")
+        local_path = str(args.get("file_path") or args.get("local_path") or args.get("path") or "").strip()
+        if not url and not local_path:
+            return _error("url or local_path/file_path/path is required for action=index")
+        is_arxiv = "arxiv.org" in url.lower()
+        # Nia currently accepts gcs_path uploads only for documentation sources.
+        # arXiv URLs can be research_paper; uploaded local PDFs/books are indexed
+        # as documentation with is_pdf=true and source_subtype=pdf.
+        effective_type = "documentation" if local_path else (source_type or ("research_paper" if is_arxiv else "documentation"))
         body: Dict[str, Any] = {
-            "type": "documentation",
-            "url": url,
+            "type": effective_type,
             "limit": _int_arg(args, "limit", 1000),
             "only_main_content": _bool_arg(args, "only_main_content") if _bool_arg(args, "only_main_content") is not None else True,
         }
+        if url:
+            body["url"] = url
+        if local_path:
+            upload = _upload_local_file_to_nia(local_path)
+            if upload.get("error"):
+                return _json(upload)
+            body["gcs_path"] = upload["gcs_path"]
+            body["is_pdf"] = upload.get("content_type") == "application/pdf"
+            body.setdefault("display_name", upload.get("filename"))
         for key in ("display_name", "focus", "url_patterns", "exclude_patterns", "llms_txt_strategy"):
             if args.get(key):
                 out_key = "focus_instructions" if key == "focus" else key
@@ -269,10 +319,12 @@ def nia_sources_tool(args: Dict[str, Any], **kw) -> str:
         qs = _query({"path": args.get("path", "/")})
         return _json(_request("GET", f"/sources/{sid}/tree?{qs}"))
     if action == "read":
-        if not args.get("path"):
-            return _error("path is required for action=read")
+        if not args.get("path") and not args.get("page") and not args.get("tree_node_id"):
+            return _error("path, page, or tree_node_id is required for action=read")
         qs = _query({
             "path": args.get("path"),
+            "page": args.get("page"),
+            "tree_node_id": args.get("tree_node_id"),
             "line_start": args.get("line_start"),
             "line_end": args.get("line_end"),
             "max_length": args.get("max_length"),
@@ -298,6 +350,67 @@ def _csv_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(v).strip() for v in value if str(v).strip()]
     return [v.strip() for v in str(value).split(",") if v.strip()]
+
+
+def nia_context_tool(args: Dict[str, Any], **kw) -> str:
+    action = str(args.get("action", "search")).strip().lower()
+
+    if action == "save":
+        title = str(args.get("title", "")).strip()
+        summary = str(args.get("summary", "")).strip()
+        content = str(args.get("content", "")).strip()
+        if not title or not summary or not content:
+            return _error("title, summary, and content are required for action=save")
+        body: Dict[str, Any] = {
+            "title": title,
+            "summary": summary,
+            "content": content,
+            "agent_source": args.get("agent_source") or "hermes-centurio",
+            "tags": _csv_list(args.get("tags")),
+            "memory_type": args.get("memory_type") or "episodic",
+        }
+        for key in ("metadata", "lineage", "nia_references"):
+            if isinstance(args.get(key), dict):
+                body[key] = args[key]
+        if args.get("ttl_seconds") not in (None, ""):
+            body["ttl_seconds"] = _int_arg(args, "ttl_seconds")
+        return _json(_request("POST", "/contexts", body))
+
+    if action == "search":
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return _error("query is required for action=search")
+        qs = _query({
+            "q": query,
+            "limit": _int_arg(args, "limit", 20),
+            "include_highlights": _bool_arg(args, "include_highlights"),
+            "workspace_filter": args.get("workspace_filter"),
+        })
+        return _json(_request("GET", f"/contexts/semantic-search?{qs}"))
+
+    if action == "list":
+        qs = _query({
+            "limit": _int_arg(args, "limit", 20),
+            "offset": _int_arg(args, "offset", 0),
+            "tags": args.get("tags"),
+            "agent_source": args.get("agent_source"),
+            "memory_type": args.get("memory_type"),
+        })
+        return _json(_request("GET", "/contexts" + (f"?{qs}" if qs else "")))
+
+    if action == "get":
+        context_id = str(args.get("context_id") or args.get("id") or "").strip()
+        if not context_id:
+            return _error("context_id is required for action=get")
+        return _json(_request("GET", f"/contexts/{_quote(context_id)}"))
+
+    if action == "delete":
+        context_id = str(args.get("context_id") or args.get("id") or "").strip()
+        if not context_id:
+            return _error("context_id is required for action=delete")
+        return _json(_request("DELETE", f"/contexts/{_quote(context_id)}"))
+
+    return _error(f"Unsupported nia_context action: {action}")
 
 
 def nia_search_tool(args: Dict[str, Any], **kw) -> str:
@@ -404,10 +517,15 @@ NIA_SOURCES_SCHEMA = {
             "display_name": {"type": "string"},
             "focus": {"type": "string"},
             "add_global": {"type": "boolean"},
-            "path": {"type": "string"},
+            "path": {"type": "string", "description": "For action=index, local file path to upload; for read/ls, source path."},
+            "local_path": {"type": "string", "description": "Local PDF/spreadsheet path to upload and index."},
+            "file_path": {"type": "string", "description": "Alias for local_path when indexing local files."},
+            "source_type": {"type": "string", "description": "Source type for indexing/filtering: documentation, research_paper, huggingface_dataset, local_folder."},
             "pattern": {"type": "string"},
             "line_start": {"type": "integer"},
             "line_end": {"type": "integer"},
+            "page": {"type": "integer", "description": "For PDF sources, read a page by page number."},
+            "tree_node_id": {"type": "string", "description": "For PDF sources, read a section by tree node id from action=tree."},
             "max_length": {"type": "integer"},
             "max_total": {"type": "integer"},
             "fixed_string": {"type": "boolean"},
@@ -415,6 +533,36 @@ NIA_SOURCES_SCHEMA = {
         "required": ["action"],
     },
 }
+
+NIA_CONTEXT_SCHEMA = {
+    "name": "nia_context",
+    "description": "Save/list/search Nia shared contexts for cross-agent continuity. Use for plans, discoveries, and procedural notes that other agents should reuse.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["save", "search", "list", "get", "delete"]},
+            "title": {"type": "string"},
+            "summary": {"type": "string"},
+            "content": {"type": "string"},
+            "query": {"type": "string"},
+            "context_id": {"type": "string"},
+            "id": {"type": "string"},
+            "tags": {"type": "string", "description": "Comma-separated tags."},
+            "agent_source": {"type": "string"},
+            "memory_type": {"type": "string", "enum": ["scratchpad", "episodic", "fact", "procedural"]},
+            "ttl_seconds": {"type": "integer"},
+            "limit": {"type": "integer"},
+            "offset": {"type": "integer"},
+            "include_highlights": {"type": "boolean"},
+            "workspace_filter": {"type": "string"},
+            "metadata": {"type": "object"},
+            "lineage": {"type": "object"},
+            "nia_references": {"type": "object"},
+        },
+        "required": ["action"],
+    },
+}
+
 
 NIA_SEARCH_SCHEMA = {
     "name": "nia_search",
@@ -463,6 +611,14 @@ registry.register(
     toolset="nia",
     schema=NIA_SOURCES_SCHEMA,
     handler=nia_sources_tool,
+    check_fn=_check_nia_available,
+    emoji="🧠",
+)
+registry.register(
+    name="nia_context",
+    toolset="nia",
+    schema=NIA_CONTEXT_SCHEMA,
+    handler=nia_context_tool,
     check_fn=_check_nia_available,
     emoji="🧠",
 )
