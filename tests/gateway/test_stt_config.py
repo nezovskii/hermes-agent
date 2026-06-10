@@ -93,5 +93,3 @@ async def test_enrich_message_with_transcription_guards_empty_transcript():
     assert "empty or inaudible" in result
     assert '""' not in result
     assert transcripts == []
-
-
