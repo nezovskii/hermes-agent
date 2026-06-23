@@ -4633,9 +4633,19 @@ class AIAgent:
         return bool(streamed) and streamed == visible_content
 
     def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
-        """Surface a real mid-turn assistant commentary message to the UI layer."""
+        """Surface real mid-turn assistant commentary to the UI layer.
+
+        Do not surface assistant ``content`` that arrives in the same message as
+        tool calls. Models often put scratch narration like "I'll check X" or
+        terse operational notes in that field while choosing tools; in gateway
+        chats those notes look like leaked internal comments. The final answer
+        (or an explicit standalone assistant commentary message) is the only
+        user-facing text that should be delivered.
+        """
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(assistant_msg, dict):
+            return
+        if assistant_msg.get("tool_calls"):
             return
         content = assistant_msg.get("content")
         visible = self._strip_think_blocks(content or "").strip()
