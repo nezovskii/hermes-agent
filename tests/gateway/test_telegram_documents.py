@@ -138,6 +138,9 @@ def adapter():
     # document-routing tests need to bypass the new gate so messages from fake
     # senders reach handle_message.
     a._is_callback_user_authorized = lambda user_id, **_kw: True
+    # Keep legacy single-document tests immediate even if the developer shell has
+    # profile-level batching enabled for a live Telegram gateway.
+    a._document_batch_delay_seconds = 0
     return a
 
 
