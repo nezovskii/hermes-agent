@@ -1636,6 +1636,26 @@ def test_interim_commentary_is_not_marked_already_streamed_without_callbacks(mon
     }
 
 
+def test_interim_commentary_suppresses_content_attached_to_tool_calls(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.append(
+        {"text": text, "already_streamed": already_streamed}
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "Now I will inspect this via terminal.",
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}
+            ],
+        }
+    )
+
+    assert observed == []
+
+
 def test_interim_commentary_is_not_marked_already_streamed_when_stream_callback_fails(monkeypatch):
     agent = _build_agent(monkeypatch)
     observed = {}

@@ -2524,6 +2524,49 @@ class TelegramAdapter(BasePlatformAdapter):
                             self.name, topic_name, seed_err,
                         )
 
+    def _telegram_menu_commands(self, max_commands: int) -> tuple[list[tuple[str, str]], int]:
+        """Return Telegram menu commands, prioritizing profile quick commands.
+
+        Telegram's slash menu is capped in this adapter to avoid Bot API payload
+        limits. Profile quick commands are explicit user-facing shortcuts, so
+        keep them visible ahead of the generic built-in menu.
+        """
+        from hermes_cli.commands import telegram_menu_commands
+
+        menu_commands, hidden_count = telegram_menu_commands(max_commands=max_commands)
+        quick_entries: list[tuple[str, str]] = []
+        try:
+            from hermes_constants import get_hermes_home
+            import yaml as _yaml
+
+            config_path = get_hermes_home() / "config.yaml"
+            cfg = _yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            quick_commands = cfg.get("quick_commands") or {}
+            if isinstance(quick_commands, dict):
+                for raw_name, qcmd in quick_commands.items():
+                    if not isinstance(raw_name, str) or not isinstance(qcmd, dict):
+                        continue
+                    name = re.sub(r"[^a-z0-9_]", "_", raw_name.lower()).strip("_")[:32]
+                    if not name:
+                        continue
+                    desc = str(qcmd.get("description") or qcmd.get("target") or qcmd.get("type") or "Quick command")
+                    quick_entries.append((name, desc[:40] or "Quick command"))
+        except Exception as e:
+            logger.debug("[%s] Could not load quick commands for Telegram menu: %s", self.name, e)
+
+        if not quick_entries:
+            return menu_commands, hidden_count
+
+        seen: set[str] = set()
+        merged: list[tuple[str, str]] = []
+        for name, desc in quick_entries + menu_commands:
+            if name in seen:
+                continue
+            seen.add(name)
+            merged.append((name, desc))
+        overflow = max(0, len(merged) - max_commands)
+        return merged[:max_commands], hidden_count + overflow
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
 
@@ -2838,14 +2881,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommandScopeAllGroupChats,
                     BotCommandScopeDefault,
                 )
-                from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
+                from hermes_cli.commands import telegram_menu_max_commands
                 # Telegram allows up to 100 commands but has an undocumented
-                # payload size limit (~4KB total).  Hermes defaults to 60 to
+                # payload size limit (~4KB total). Hermes defaults to 60 to
                 # keep built-ins plus common skill commands visible while
                 # staying under the threshold; users can tune the cap via
-                # platforms.telegram.extra.command_menu.
+                # platforms.telegram.extra.command_menu. Profile quick commands
+                # are prioritized within the same cap.
                 max_commands = telegram_menu_max_commands()
-                menu_commands, hidden_count = telegram_menu_commands(max_commands=max_commands)
+                menu_commands, hidden_count = self._telegram_menu_commands(max_commands)
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 # Register for all scopes independently — Telegram picks the
                 # narrowest matching scope per chat type (forum topics fall
@@ -6828,8 +6872,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 if chat_id in self._forum_command_registered:
                     return
                 from telegram import BotCommand, BotCommandScopeChat
-                from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
-                menu_commands, _ = telegram_menu_commands(max_commands=telegram_menu_max_commands())
+                from hermes_cli.commands import telegram_menu_max_commands
+                menu_commands, _ = self._telegram_menu_commands(telegram_menu_max_commands())
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
                 self._forum_command_registered.add(chat_id)
