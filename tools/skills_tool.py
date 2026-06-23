@@ -1094,10 +1094,17 @@ def skill_view(
             # are loaded through skill_view(skill, file_path=...) and must not
             # shadow or collide with real skills that share the same basename.
             for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md" and not _is_skill_support_path(
-                    found_md
-                ):
-                    _record(None, found_md)
+                if found_md.name == "SKILL.md":
+                    continue
+                try:
+                    rel_parts = found_md.relative_to(search_dir).parts
+                except ValueError:
+                    rel_parts = found_md.parts
+                if any(part in {"templates", "references", "assets", "scripts"} for part in rel_parts[:-1]):
+                    continue
+                if _is_skill_support_path(found_md):
+                    continue
+                _record(None, found_md)
 
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
