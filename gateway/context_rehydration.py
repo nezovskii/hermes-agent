@@ -1,9 +1,9 @@
 """Deterministic context rehydration for fresh gateway sessions.
 
 This module intentionally avoids LLM calls.  It builds a bounded packet from
-trusted local gateway state (exact session lane history) so a fresh/reset
-Telegram topic or Slack thread can restart with useful context without asking
-the user to retell the story.
+trusted local gateway state (room policy + exact session lane history) so a
+fresh/reset Telegram topic or Slack thread can restart with useful context
+without asking the user to retell the story.
 """
 
 from __future__ import annotations
@@ -15,7 +15,8 @@ import logging
 import re
 import time
 
-from gateway.config import ContextRehydrationConfig, GatewayConfig
+from gateway.config import ContextRehydrationConfig, GatewayConfig, Platform
+from gateway.platforms.base import resolve_channel_prompt
 from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,7 @@ class ContextRehydrator:
         *,
         source: SessionSource,
         current_text: str = "",
+        room_policy: str | None = None,
         session_id: str | None = None,
     ) -> RehydrationPacket:
         cfg = self.config
@@ -117,6 +119,12 @@ class ContextRehydrator:
             "[CONTEXT REHYDRATION — trusted local gateway context]",
             f"Scope: {self._scope_label(source)}",
         ]
+
+        if cfg.include_room_policy:
+            policy = room_policy or self.resolve_room_policy(source)
+            if policy:
+                counts["room_policy"] = 1
+                sections.extend(["", "## Room policy", _clean_text(policy, max_chars=1200)])
 
         if cfg.include_session_lane_recap:
             try:
@@ -136,6 +144,26 @@ class ContextRehydrator:
         text = "\n".join(part for part in sections if part is not None).strip()
         text = self._cap_packet(text, cfg.max_chars)
         return RehydrationPacket(text=text, source_counts=counts, warnings=warnings)
+
+    def resolve_room_policy(self, source: SessionSource) -> str | None:
+        platform_cfg = self.gateway_config.platforms.get(source.platform)
+        if not platform_cfg:
+            return None
+        extra = platform_cfg.extra or {}
+        keys: list[str] = []
+        if source.thread_id and source.platform == Platform.TELEGRAM:
+            keys.append(str(source.thread_id))
+        if source.thread_id:
+            keys.append(str(source.thread_id))
+        if source.chat_id:
+            keys.append(str(source.chat_id))
+        parent_id = source.parent_chat_id or source.chat_id
+        for key in keys:
+            prompt = resolve_channel_prompt(extra, key, str(parent_id) if parent_id else None)
+            if prompt:
+                return prompt
+        prompt = resolve_channel_prompt(extra, str(source.chat_id), str(parent_id) if parent_id else None)
+        return prompt
 
     def fetch_lane_snippets(
         self,
