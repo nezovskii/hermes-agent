@@ -9951,6 +9951,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+
+        try:
+            from gateway.context_rehydration import ContextRehydrator
+
+            rehydrator = ContextRehydrator(
+                self.config,
+                session_db=getattr(self, "_session_db", None),
+                log=logger,
+            )
+            if rehydrator.should_rehydrate(
+                is_new_session=_is_new_session,
+                was_auto_reset=_was_auto_reset,
+                source=source,
+            ):
+                packet = rehydrator.build_packet(
+                    source=source,
+                    current_text=getattr(event, "text", "") or "",
+                    session_id=session_entry.session_id,
+                )
+                if packet.text:
+                    context_prompt = f"{context_prompt}\n\n{packet.text}"
+                    logger.info(
+                        "context_rehydration built session_key=%s chars=%s sources=%s warnings=%s",
+                        session_key,
+                        len(packet.text),
+                        packet.source_counts,
+                        len(packet.warnings),
+                    )
+        except Exception:
+            logger.debug("context rehydration failed", exc_info=True)
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
