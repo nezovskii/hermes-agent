@@ -9968,6 +9968,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 packet = rehydrator.build_packet(
                     source=source,
                     current_text=getattr(event, "text", "") or "",
+                    room_policy=getattr(event, "channel_prompt", None),
                     session_id=session_entry.session_id,
                 )
                 if packet.text:

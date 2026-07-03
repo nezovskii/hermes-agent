@@ -418,6 +418,7 @@ class ContextRehydrationConfig:
     enabled: bool = False
     trigger: str = "fresh_or_reset_session"
     max_chars: int = 6000
+    include_room_policy: bool = True
     include_session_lane_recap: bool = True
     include_sibling_thread_recap: bool = False
     include_gbrain_private: bool = False
@@ -432,6 +433,7 @@ class ContextRehydrationConfig:
             "trigger": self.trigger,
             "max_chars": self.max_chars,
             "include": {
+                "room_policy": self.include_room_policy,
                 "session_lane_recap": self.include_session_lane_recap,
                 "sibling_thread_recap": self.include_sibling_thread_recap,
                 "gbrain_private": self.include_gbrain_private,
@@ -455,6 +457,7 @@ class ContextRehydrationConfig:
             enabled=_coerce_bool(data.get("enabled"), False),
             trigger=trigger,
             max_chars=max(_coerce_int(data.get("max_chars"), 6000), 0),
+            include_room_policy=_coerce_bool(include.get("room_policy"), True),
             include_session_lane_recap=_coerce_bool(include.get("session_lane_recap"), True),
             include_sibling_thread_recap=_coerce_bool(include.get("sibling_thread_recap"), False),
             include_gbrain_private=_coerce_bool(include.get("gbrain_private"), False),

@@ -6,6 +6,7 @@ def test_context_rehydration_defaults_disabled():
 
     assert cfg.context_rehydration.enabled is False
     assert cfg.context_rehydration.trigger == "fresh_or_reset_session"
+    assert cfg.context_rehydration.include_room_policy is True
     assert cfg.context_rehydration.include_session_lane_recap is True
 
 
@@ -16,6 +17,7 @@ def test_context_rehydration_parses_nested_config():
             "trigger": "manual_only",
             "max_chars": "1234",
             "include": {
+                "room_policy": "false",
                 "session_lane_recap": "true",
                 "sibling_thread_recap": "true",
                 "gbrain_private": "true",
@@ -45,6 +47,7 @@ def test_context_rehydration_parses_nested_config():
     assert cr.enabled is True
     assert cr.trigger == "manual_only"
     assert cr.max_chars == 1234
+    assert cr.include_room_policy is False
     assert cr.include_session_lane_recap is True
     assert cr.include_sibling_thread_recap is True
     assert cr.include_gbrain_private is True
