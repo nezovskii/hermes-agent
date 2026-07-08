@@ -723,6 +723,14 @@ class BaseEnvironment(ABC):
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
+                    # Close the pipe read-end on this early-return path too;
+                    # only the natural-exit path closed it before, leaking one
+                    # fd per interrupted command (idempotent — safe if already
+                    # closed / None).
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
                     return {
                         "output": "".join(output_chunks) + "\n[Command interrupted]",
                         "returncode": 130,
@@ -736,6 +744,12 @@ class BaseEnvironment(ABC):
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
+                    # Close the pipe read-end on the timeout path (previously
+                    # leaked one fd per timed-out command).
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
                     partial = "".join(output_chunks)
                     timeout_msg = f"\n[Command timed out after {timeout}s]"
                     return {
@@ -794,6 +808,12 @@ class BaseEnvironment(ABC):
             try:
                 self._kill_process(proc)
                 drain_thread.join(timeout=2)
+                # Close the pipe read-end before propagating so a
+                # SIGTERM/SIGINT during a command doesn't leak an fd.
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
             except Exception:
                 pass  # cleanup is best-effort
             raise

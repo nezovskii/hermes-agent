@@ -19796,6 +19796,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    # Raise the open-file-descriptor soft limit before anything opens fds.
+    # macOS launchd/GUI-spawned processes inherit RLIMIT_NOFILE=256, which a
+    # multi-adapter gateway (persistent httpx pools, SQLite, MCP, LLM client)
+    # sits dangerously close to — any leak or reconnect churn then exhausts the
+    # table and every open() raises EMFILE. Best-effort; never blocks startup.
+    from gateway.fd_limits import raise_fd_limit
+    raise_fd_limit()
+
     # Snapshot the checkout revision now, while sys.modules still matches disk,
     # so a later `git pull` under this long-lived process can be detected (and
     # risky work like model switching refused) instead of crashing on a stale
