@@ -550,8 +550,38 @@ async def test_heartbeat_loop_exits_cleanly_on_cancel():
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_loop_triggers_reconnect_on_timeout():
-    """A TimeoutError from get_me() must schedule a reconnect via _handle_polling_network_error."""
+async def test_heartbeat_loop_debounces_first_get_me_timeout():
+    """A single get_me() timeout is noisy Bot API path evidence, not a poller wedge."""
+    adapter = _make_adapter()
+    adapter._handle_polling_network_error = AsyncMock()
+
+    mock_app = MagicMock()
+    adapter._app = mock_app
+
+    sleep_call = 0
+
+    async def fast_sleep(seconds):
+        nonlocal sleep_call
+        sleep_call += 1
+        if sleep_call >= 2:
+            raise asyncio.CancelledError()
+
+    async def fast_wait_for(coro, timeout):
+        if asyncio.iscoroutine(coro):
+            coro.close()
+        raise asyncio.TimeoutError()
+
+    with patch("asyncio.sleep", side_effect=fast_sleep):
+        with patch("plugins.platforms.telegram.adapter.asyncio.wait_for", side_effect=fast_wait_for):
+            await adapter._polling_heartbeat_loop()
+
+    assert adapter._polling_error_task is None
+    assert adapter._polling_heartbeat_failure_count == 1
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_triggers_reconnect_after_consecutive_timeouts():
+    """Two consecutive get_me() timeouts schedule polling recovery."""
     adapter = _make_adapter()
     adapter._handle_polling_network_error = AsyncMock()
 
@@ -575,13 +605,18 @@ async def test_heartbeat_loop_triggers_reconnect_on_timeout():
         with patch("plugins.platforms.telegram.adapter.asyncio.wait_for", side_effect=fast_wait_for):
             await adapter._polling_heartbeat_loop()
 
-    # A reconnect task must have been created.
+    # A reconnect task must have been created only after the second failure.
     assert adapter._polling_error_task is not None
+    adapter._polling_error_task.cancel()
+    try:
+        await adapter._polling_error_task
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 @pytest.mark.asyncio
 async def test_heartbeat_loop_triggers_reconnect_on_os_error():
-    """An OSError (e.g. connection reset) from get_me() must trigger a reconnect."""
+    """Repeated OSError failures from get_me() must trigger a reconnect."""
     adapter = _make_adapter()
     adapter._handle_polling_network_error = AsyncMock()
 
@@ -606,6 +641,11 @@ async def test_heartbeat_loop_triggers_reconnect_on_os_error():
             await adapter._polling_heartbeat_loop()
 
     assert adapter._polling_error_task is not None
+    adapter._polling_error_task.cancel()
+    try:
+        await adapter._polling_error_task
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 @pytest.mark.asyncio

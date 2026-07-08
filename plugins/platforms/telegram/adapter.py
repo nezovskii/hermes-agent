@@ -582,6 +582,13 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
         self._polling_heartbeat_task: Optional[asyncio.Task] = None
+        # Consecutive get_me() connectivity failures from the steady-state
+        # heartbeat. A single failed get_me() proves the general Bot API path is
+        # flaky, but not that the getUpdates poller is wedged. Debounce that
+        # noisy signal so transient Telegram/proxy timeouts do not churn the
+        # polling task; explicit PTB polling errors and stuck-consumer probes
+        # still enter recovery immediately via their own paths.
+        self._polling_heartbeat_failure_count: int = 0
         # Consecutive heartbeat probes that saw queued updates the running
         # poller is not consuming. get_me() can't see this — the send path is
         # healthy while the getUpdates consumer is wedged — so the heartbeat
@@ -2236,6 +2243,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not callable(getattr(bot, "get_me", None)):
                     return
                 await asyncio.wait_for(bot.get_me(), PROBE_TIMEOUT)
+                self._polling_heartbeat_failure_count = 0
                 # get_me() succeeded — the general/send request path is healthy.
                 # That does NOT prove the getUpdates consumer is alive: PTB can
                 # report updater.running=True while the long-poll task is wedged,
@@ -2249,16 +2257,29 @@ class TelegramAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 return
             except (asyncio.TimeoutError, OSError) as probe_err:
+                self._polling_heartbeat_failure_count += 1
+                failure_count = self._polling_heartbeat_failure_count
+                safe_probe_error = _redact_telegram_error_text(probe_err)
+                if failure_count < 2:
+                    logger.warning(
+                        "[%s] Polling heartbeat probe failed (%s; failure %d/2); "
+                        "waiting for a second consecutive failure before reconnect",
+                        self.name, safe_probe_error, failure_count,
+                    )
+                    continue
                 logger.warning(
-                    "[%s] Polling heartbeat probe failed (%s); triggering reconnect",
-                    self.name, probe_err,
+                    "[%s] Polling heartbeat probe failed (%s; failure %d/2); triggering reconnect",
+                    self.name, safe_probe_error, failure_count,
                 )
                 if self._polling_error_task and not self._polling_error_task.done():
                     continue   # reconnect already in progress
+                self._polling_heartbeat_failure_count = 0
                 loop = asyncio.get_running_loop()
                 self._polling_error_task = loop.create_task(
                     self._handle_polling_network_error(probe_err)
                 )
+                self._background_tasks.add(self._polling_error_task)
+                self._polling_error_task.add_done_callback(self._background_tasks.discard)
             except Exception:
                 # Non-connectivity errors (e.g. TelegramError 401) are not
                 # CLOSE-WAIT symptoms — let PTB's own handlers surface them.
