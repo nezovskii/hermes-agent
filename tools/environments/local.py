@@ -986,6 +986,36 @@ class LocalEnvironment(BaseEnvironment):
         """Use native paths for Python, but Git Bash-friendly paths for cd."""
         return BaseEnvironment._quote_cwd_for_cd(_windows_to_msys_path(cwd))
 
+    def _recover_missing_cwd(self, cwd: str) -> str:
+        """Return an existing cwd, logging once when recovery is needed."""
+        safe_cwd = _resolve_safe_cwd(cwd)
+        if safe_cwd != cwd:
+            # MSYS → Windows translation alone shouldn't surface as a warning
+            # (it's a benign normalization, not a recovery). Only warn when
+            # the directory really doesn't exist on disk.
+            normalized = _msys_to_windows_path(cwd) if _IS_WINDOWS else cwd
+            if safe_cwd != normalized:
+                logger.warning(
+                    "LocalEnvironment cwd %r is missing on disk; "
+                    "falling back to %r so terminal commands keep working.",
+                    cwd,
+                    safe_cwd,
+                )
+            if cwd == self.cwd:
+                self.cwd = safe_cwd
+        return safe_cwd
+
+    def _resolve_effective_cwd(self, cwd: str) -> str:
+        """Recover a deleted cwd before the shell wrapper emits ``cd``.
+
+        ``BaseEnvironment.execute`` embeds the effective cwd in the generated
+        bash script as ``builtin cd -- <cwd>``.  If a stale worktree path is
+        only repaired later in ``_run_bash`` (as the subprocess cwd), bash still
+        tries to cd into the deleted worktree and exits 126 before running the
+        user's command.  Repair the wrapper cwd at the same seam.
+        """
+        return self._recover_missing_cwd(cwd)
+
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
@@ -1013,20 +1043,7 @@ class LocalEnvironment(BaseEnvironment):
         # POSIX paths (``/c/Users/...``) to native form so a perfectly valid
         # ``pwd -P`` result from bash isn't mistakenly treated as "missing"
         # and spammed as a warning on every command.
-        safe_cwd = _resolve_safe_cwd(self.cwd)
-        if safe_cwd != self.cwd:
-            # MSYS → Windows translation alone shouldn't surface as a warning
-            # (it's a benign normalization, not a recovery). Only warn when
-            # the directory really doesn't exist on disk.
-            normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
-            if safe_cwd != normalized:
-                logger.warning(
-                    "LocalEnvironment cwd %r is missing on disk; "
-                    "falling back to %r so terminal commands keep working.",
-                    self.cwd,
-                    safe_cwd,
-                )
-            self.cwd = safe_cwd
+        self._recover_missing_cwd(self.cwd)
 
         _popen_cwd = self.cwd
 

@@ -2179,10 +2179,12 @@ DEFAULT_CONFIG = {
         "provider": "",
     },
 
-    # Subagent delegation — override the provider:model used by delegate_task
-    # so child agents can run on a different (cheaper/faster) provider and model.
-    # Uses the same runtime provider resolution as CLI/gateway startup, so all
-    # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
+    # Subagent delegation — default provider:model override for delegate_task so
+    # child agents can run on a different (cheaper/faster) provider and model.
+    # Individual delegate_task calls may still pass model={provider, model} to
+    # route one child differently (for example a fast coding worker) while other
+    # children inherit this config or the parent. Uses the same runtime provider
+    # resolution as CLI/gateway startup, so all configured providers are supported.
     "delegation": {
         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)

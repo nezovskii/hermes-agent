@@ -237,7 +237,7 @@ def _get_firecrawl_client() -> Any:
             "firecrawl", token_reader=_wt._read_nous_access_token
         )
         if managed_gateway is None:
-            logger.error(
+            logger.debug(
                 "Firecrawl client initialization failed: "
                 "missing direct config and tool-gateway auth."
             )

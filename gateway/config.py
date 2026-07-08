@@ -435,6 +435,150 @@ class ChannelOverride:
 
 
 @dataclass
+class ContextRehydrationSessionDbConfig:
+    lookback_days: int = 30
+    max_sessions: int = 4
+    max_messages_per_session: int = 12
+    include_bookends: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "lookback_days": self.lookback_days,
+            "max_sessions": self.max_sessions,
+            "max_messages_per_session": self.max_messages_per_session,
+            "include_bookends": self.include_bookends,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ContextRehydrationSessionDbConfig":
+        if not isinstance(data, dict):
+            data = {}
+        return cls(
+            lookback_days=max(_coerce_int(data.get("lookback_days"), 30), 1),
+            max_sessions=max(_coerce_int(data.get("max_sessions"), 4), 1),
+            max_messages_per_session=max(_coerce_int(data.get("max_messages_per_session"), 12), 1),
+            include_bookends=_coerce_bool(data.get("include_bookends"), True),
+        )
+
+
+@dataclass
+class ContextRehydrationGBrainConfig:
+    max_results: int = 5
+    max_chars: int = 2500
+    query_from: tuple = ("current_user_message", "room_name", "room_policy")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "max_results": self.max_results,
+            "max_chars": self.max_chars,
+            "query_from": list(self.query_from),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ContextRehydrationGBrainConfig":
+        if not isinstance(data, dict):
+            data = {}
+        query_from = data.get("query_from")
+        if isinstance(query_from, str):
+            query_from = [query_from]
+        if not isinstance(query_from, list) or not query_from:
+            query_from = ["current_user_message", "room_name", "room_policy"]
+        return cls(
+            max_results=max(_coerce_int(data.get("max_results"), 5), 1),
+            max_chars=max(_coerce_int(data.get("max_chars"), 2500), 0),
+            query_from=tuple(str(item) for item in query_from if str(item).strip()),
+        )
+
+
+@dataclass
+class ContextRehydrationPrivacyConfig:
+    private_brain_home: Optional[str] = None
+    allow_team_gbrain: bool = False
+    allow_private_gbrain: bool = False
+    forbidden_private_brains: tuple = ()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "private_brain_home": self.private_brain_home,
+            "allow_team_gbrain": self.allow_team_gbrain,
+            "allow_private_gbrain": self.allow_private_gbrain,
+            "forbidden_private_brains": list(self.forbidden_private_brains),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ContextRehydrationPrivacyConfig":
+        if not isinstance(data, dict):
+            data = {}
+        forbidden = data.get("forbidden_private_brains") or []
+        if isinstance(forbidden, str):
+            forbidden = [forbidden]
+        if not isinstance(forbidden, list):
+            forbidden = []
+        private_home = data.get("private_brain_home")
+        return cls(
+            private_brain_home=str(private_home) if private_home else None,
+            allow_team_gbrain=_coerce_bool(data.get("allow_team_gbrain"), False),
+            allow_private_gbrain=_coerce_bool(data.get("allow_private_gbrain"), False),
+            forbidden_private_brains=tuple(str(item) for item in forbidden if str(item).strip()),
+        )
+
+
+@dataclass
+class ContextRehydrationConfig:
+    enabled: bool = False
+    trigger: str = "fresh_or_reset_session"
+    max_chars: int = 6000
+    include_room_policy: bool = True
+    include_session_lane_recap: bool = True
+    include_sibling_thread_recap: bool = False
+    include_gbrain_private: bool = False
+    include_gbrain_team: bool = False
+    session_db: ContextRehydrationSessionDbConfig = field(default_factory=ContextRehydrationSessionDbConfig)
+    gbrain: ContextRehydrationGBrainConfig = field(default_factory=ContextRehydrationGBrainConfig)
+    privacy: ContextRehydrationPrivacyConfig = field(default_factory=ContextRehydrationPrivacyConfig)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "trigger": self.trigger,
+            "max_chars": self.max_chars,
+            "include": {
+                "room_policy": self.include_room_policy,
+                "session_lane_recap": self.include_session_lane_recap,
+                "sibling_thread_recap": self.include_sibling_thread_recap,
+                "gbrain_private": self.include_gbrain_private,
+                "gbrain_team": self.include_gbrain_team,
+            },
+            "session_db": self.session_db.to_dict(),
+            "gbrain": self.gbrain.to_dict(),
+            "privacy": self.privacy.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ContextRehydrationConfig":
+        if not isinstance(data, dict):
+            data = {}
+        include_raw = data.get("include")
+        include: Dict[str, Any] = include_raw if isinstance(include_raw, dict) else {}
+        trigger = str(data.get("trigger") or "fresh_or_reset_session")
+        if trigger not in {"fresh_or_reset_session", "every_session_after_idle", "manual_only"}:
+            trigger = "fresh_or_reset_session"
+        return cls(
+            enabled=_coerce_bool(data.get("enabled"), False),
+            trigger=trigger,
+            max_chars=max(_coerce_int(data.get("max_chars"), 6000), 0),
+            include_room_policy=_coerce_bool(include.get("room_policy"), True),
+            include_session_lane_recap=_coerce_bool(include.get("session_lane_recap"), True),
+            include_sibling_thread_recap=_coerce_bool(include.get("sibling_thread_recap"), False),
+            include_gbrain_private=_coerce_bool(include.get("gbrain_private"), False),
+            include_gbrain_team=_coerce_bool(include.get("gbrain_team"), False),
+            session_db=ContextRehydrationSessionDbConfig.from_dict(data.get("session_db", {})),
+            gbrain=ContextRehydrationGBrainConfig.from_dict(data.get("gbrain", {})),
+            privacy=ContextRehydrationPrivacyConfig.from_dict(data.get("privacy", {})),
+        )
+
+
+@dataclass
 class PlatformConfig:
     """Configuration for a single messaging platform."""
     enabled: bool = False
@@ -663,6 +807,9 @@ class GatewayConfig:
 
     # User-defined quick commands (slash commands that bypass the agent loop)
     quick_commands: Dict[str, Any] = field(default_factory=dict)
+
+    # Deterministic context rehydration for fresh/reset gateway sessions.
+    context_rehydration: ContextRehydrationConfig = field(default_factory=ContextRehydrationConfig)
     
     # Storage paths
     sessions_dir: Path = field(default_factory=lambda: get_hermes_home() / "sessions")
@@ -806,6 +953,7 @@ class GatewayConfig:
             },
             "reset_triggers": self.reset_triggers,
             "quick_commands": self.quick_commands,
+            "context_rehydration": self.context_rehydration.to_dict(),
             "sessions_dir": str(self.sessions_dir),
             "write_sessions_json": self.write_sessions_json,
             "always_log_local": self.always_log_local,
@@ -914,6 +1062,9 @@ class GatewayConfig:
             reset_by_platform=reset_by_platform,
             reset_triggers=data.get("reset_triggers", ["/new", "/reset"]),
             quick_commands=quick_commands,
+            context_rehydration=ContextRehydrationConfig.from_dict(
+                data.get("context_rehydration", {})
+            ),
             sessions_dir=sessions_dir,
             write_sessions_json=_coerce_bool(data.get("write_sessions_json"), True),
             always_log_local=_coerce_bool(data.get("always_log_local"), True),
@@ -1060,6 +1211,9 @@ def load_gateway_config() -> GatewayConfig:
 
             if "reset_triggers" in yaml_cfg:
                 gw_data["reset_triggers"] = yaml_cfg["reset_triggers"]
+
+            if isinstance(yaml_cfg.get("context_rehydration"), dict):
+                gw_data["context_rehydration"] = yaml_cfg["context_rehydration"]
 
             if "always_log_local" in yaml_cfg:
                 gw_data["always_log_local"] = yaml_cfg["always_log_local"]

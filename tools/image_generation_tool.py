@@ -23,6 +23,7 @@ update when it's noticed.
 import json
 import logging
 import os
+import base64
 import datetime
 import threading
 import uuid
@@ -731,6 +732,59 @@ def _looks_like_absolute_file_path(value: str) -> bool:
     return len(value) >= 3 and value[1] == ":" and value[2] in {"/", "\\"}
 
 
+def _upload_local_fal_source_image(value: str) -> str:
+    """Return a FAL-accessible URL for a source image.
+
+    FAL edit endpoints run remotely, so an absolute local path supplied by the
+    agent (for example a Telegram-cached image under ``$HERMES_HOME/cache/images``)
+    must be uploaded to fal.media before being placed in ``image_urls``. Public
+    URLs and data URIs are already remote/self-contained and pass through.
+    """
+    if not _looks_like_absolute_file_path(value):
+        return value
+    if not os.path.exists(value):
+        raise ValueError(f"Source image local path does not exist: {value}")
+    client = _load_fal_client()
+    try:
+        return str(client.upload_file(value))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(
+            f"Could not upload local source image to FAL for editing: {exc}"
+        ) from exc
+
+
+def _materialize_data_image_url(value: str, *, output_format: Optional[str] = None) -> str:
+    """Persist a ``data:image/...`` URI to the Hermes image cache.
+
+    Some FAL edit endpoints return inline data URIs instead of hosted URLs.
+    Returning the huge data URI directly bloats tool output and may not be
+    deliverable by platform adapters, so convert it to a normal local artifact.
+    """
+    if not (isinstance(value, str) and value.startswith("data:image/") and "," in value):
+        return value
+    header, b64 = value.split(",", 1)
+    mime = header.split(";", 1)[0].split(":", 1)[-1].lower()
+    ext = "png"
+    if "jpeg" in mime or "jpg" in mime:
+        ext = "jpg"
+    elif "webp" in mime:
+        ext = "webp"
+    elif isinstance(output_format, str) and output_format.strip():
+        ext = output_format.strip().lower().lstrip(".")
+    try:
+        raw = base64.b64decode(b64)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"Could not decode generated data image: {exc}") from exc
+    home = os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    cache_dir = os.path.join(home, "cache", "images")
+    os.makedirs(cache_dir, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(cache_dir, f"fal_edit_{stamp}_{uuid.uuid4().hex[:8]}.{ext}")
+    with open(path, "wb") as fh:
+        fh.write(raw)
+    return path
+
+
 def _active_terminal_env(task_id: str | None):
     try:
         from tools.terminal_tool import get_active_env
@@ -934,9 +988,13 @@ def image_generate_tool(
             overrides["output_format"] = output_format
 
         if use_edit:
-            # Clamp reference count to the model's declared cap.
+            # Clamp reference count to the model's declared cap, then make any
+            # local source files remotely accessible to FAL before submitting.
             max_refs = int(meta.get("max_reference_images") or 1)
             clamped_sources = source_images[:max_refs] if max_refs > 0 else source_images
+            clamped_sources = [
+                _upload_local_fal_source_image(src) for src in clamped_sources
+            ]
             arguments = _build_fal_edit_payload(
                 model_id, prompt, clamped_sources, aspect_lc,
                 seed=seed, overrides=overrides,
@@ -978,13 +1036,15 @@ def image_generate_tool(
             if not (isinstance(img, dict) and "url" in img):
                 continue
             original_image = {
-                "url": img["url"],
+                "url": _materialize_data_image_url(
+                    img["url"], output_format=output_format or arguments.get("output_format")
+                ),
                 "width": img.get("width", 0),
                 "height": img.get("height", 0),
             }
 
             if should_upscale:
-                upscaled_image = _upscale_image(img["url"], prompt.strip())
+                upscaled_image = _upscale_image(original_image["url"], prompt.strip())
                 if upscaled_image:
                     formatted_images.append(upscaled_image)
                     continue

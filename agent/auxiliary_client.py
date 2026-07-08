@@ -3193,9 +3193,10 @@ def _evict_cached_clients(provider: str) -> None:
             if _normalize_aux_provider(str(key[0])) == normalized
         ]
         for key in stale_keys:
-            client = _client_cache.get(key, (None, None, None))[0]
+            _entry = _client_cache.get(key, (None, None, None))
+            client = _entry[0]
             if client is not None:
-                _force_close_async_httpx(client)
+                _force_close_async_httpx(client, bound_loop=_entry[2])
                 try:
                     close_fn = getattr(client, "close", None)
                     if callable(close_fn):
@@ -5537,7 +5538,7 @@ def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[
     with _client_cache_lock:
         old_entry = _client_cache.get(cache_key)
         if old_entry is not None and old_entry[0] is not client:
-            _force_close_async_httpx(old_entry[0])
+            _force_close_async_httpx(old_entry[0], bound_loop=old_entry[2])
             try:
                 close_fn = getattr(old_entry[0], "close", None)
                 if callable(close_fn):
@@ -5625,17 +5626,37 @@ def neuter_async_httpx_del() -> None:
         pass  # Graceful degradation if the SDK changes its internals
 
 
-def _force_close_async_httpx(client: Any) -> None:
-    """Mark the httpx AsyncClient inside an AsyncOpenAI client as closed.
+def _force_close_async_httpx(client: Any, bound_loop: Any = None) -> None:
+    """Release the httpx AsyncClient inside an AsyncOpenAI client on eviction.
 
-    This prevents ``AsyncHttpxClientWrapper.__del__`` from scheduling
-    ``aclose()`` on a (potentially closed) event loop, which causes
-    ``RuntimeError: Event loop is closed`` → prompt_toolkit's
-    "Press ENTER to continue..." handler.
+    Preferred path: when the client's bound event loop is the loop currently
+    running in THIS thread, schedule a real ``aclose()`` so the connection
+    pool's sockets are actually released. Leaving them to GC (the old
+    behaviour) accumulates ESTABLISHED sockets in a long-running gateway and
+    walks toward EMFILE. Cross-loop ``aclose()`` deadlocks, so this runs ONLY
+    on the client's own loop; ``bound_loop`` is the loop recorded in the cache
+    entry when the client was created.
 
-    We intentionally do NOT run the full async close path — the
-    connections will be dropped by the OS when the process exits.
+    Fallback (no running loop, or a different/closed loop): mark the inner
+    httpx client closed. That still prevents ``AsyncHttpxClientWrapper.__del__``
+    from scheduling ``aclose()`` on a dead loop (→ ``RuntimeError: Event loop
+    is closed`` → prompt_toolkit's "Press ENTER to continue...").
     """
+    try:
+        import asyncio as _aio
+        close_fn = getattr(client, "close", None)
+        if bound_loop is not None and _aio.iscoroutinefunction(close_fn):
+            try:
+                running = _aio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is bound_loop and not running.is_closed():
+                # Real close on the client's own live loop — frees the sockets
+                # now instead of leaving them to GC.
+                running.create_task(close_fn())
+                return
+    except Exception:
+        pass
     try:
         from httpx._client import ClientState
         inner = getattr(client, "_client", None)
@@ -5659,8 +5680,9 @@ def shutdown_cached_clients() -> None:
             if client is None:
                 continue
             # Mark any async httpx transport as closed first (prevents __del__
-            # from scheduling aclose() on a dead event loop).
-            _force_close_async_httpx(client)
+            # from scheduling aclose() on a dead event loop). entry[2] is the
+            # client's bound loop, so a real aclose() runs when it's still live.
+            _force_close_async_httpx(client, bound_loop=entry[2])
             # Sync clients: close the httpx connection pool cleanly.
             # Async clients: skip — we already neutered __del__ above.
             try:
@@ -5685,7 +5707,7 @@ def cleanup_stale_async_clients() -> None:
         for key, entry in _client_cache.items():
             client, _default, cached_loop = entry
             if cached_loop is not None and cached_loop.is_closed():
-                _force_close_async_httpx(client)
+                _force_close_async_httpx(client, bound_loop=cached_loop)
                 stale_keys.append(key)
         for key in stale_keys:
             del _client_cache[key]
@@ -5781,7 +5803,7 @@ def _get_cached_client(
                     effective = _compat_model(cached_client, model, cached_default)
                     return cached_client, effective
                 # Stale — evict and fall through to create a new client.
-                _force_close_async_httpx(cached_client)
+                _force_close_async_httpx(cached_client, bound_loop=cached_loop)
                 del _client_cache[cache_key]
             else:
                 effective = _compat_model(cached_client, model, cached_default)
@@ -5820,7 +5842,7 @@ def _get_cached_client(
                 # the oldest entries (FIFO — dict preserves insertion order).
                 while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
                     evict_key, evict_entry = next(iter(_client_cache.items()))
-                    _force_close_async_httpx(evict_entry[0])
+                    _force_close_async_httpx(evict_entry[0], bound_loop=evict_entry[2])
                     del _client_cache[evict_key]
                 _client_cache[cache_key] = (client, default_model, bound_loop)
             else:

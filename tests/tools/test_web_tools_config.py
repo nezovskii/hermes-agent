@@ -71,6 +71,21 @@ class TestFirecrawlClientConfig:
                 with pytest.raises(ValueError, match="FIRECRAWL_API_KEY"):
                     _get_firecrawl_client()
 
+    def test_no_config_does_not_emit_error_log(self, caplog):
+        """A stale/bypassed web tool call with Firecrawl disabled is user-facing, not a gateway ERROR."""
+        with patch("tools.web_tools.Firecrawl"):
+            with patch("tools.web_tools._read_nous_access_token", return_value=None):
+                from tools.web_tools import _get_firecrawl_client
+                with caplog.at_level("DEBUG", logger="plugins.web.firecrawl.provider"):
+                    with pytest.raises(ValueError, match="FIRECRAWL_API_KEY"):
+                        _get_firecrawl_client()
+
+        assert not [
+            record for record in caplog.records
+            if record.levelname == "ERROR"
+            and "missing direct config and tool-gateway auth" in record.getMessage()
+        ]
+
     def test_tool_gateway_domain_builds_firecrawl_gateway_origin(self):
         """Shared gateway domain should derive the Firecrawl vendor hostname."""
         with patch.dict(os.environ, {"TOOL_GATEWAY_DOMAIN": "nousresearch.com"}):

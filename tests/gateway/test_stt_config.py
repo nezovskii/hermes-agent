@@ -185,3 +185,6 @@ async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
     # Success path: the transcript passes through as a plain quoted line, with
     # no "voice message" meta-commentary that the LLM would echo back.
     assert "queued voice transcript" in result
+    assert "voice_message_transcript" in result
+    assert "do_not_echo" in result
+    assert "Here's what they said" not in result

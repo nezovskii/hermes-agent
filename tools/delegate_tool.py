@@ -2343,6 +2343,7 @@ def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
+    model: Optional[Any] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
@@ -2423,7 +2424,7 @@ def delegate_task(
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        default_creds = _resolve_delegation_credentials(cfg, parent_agent, model_override=model)
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -2485,6 +2486,16 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            task_model_override = t.get("model") if "model" in t else model
+            if task_model_override is not model:
+                try:
+                    task_creds = _resolve_delegation_credentials(
+                        cfg, parent_agent, model_override=task_model_override
+                    )
+                except ValueError as exc:
+                    return tool_error(f"Task {i} model override failed: {exc}")
+            else:
+                task_creds = default_creds
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2492,16 +2503,16 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
+                override_acp_command=task_creds.get("command"),
+                override_acp_args=task_creds.get("args"),
                 role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)
@@ -2827,6 +2838,16 @@ def delegate_task(
                     pass
 
         _goals = [t["goal"] for t in task_list]
+        _child_models = {
+            getattr(child, "model", None)
+            for (_, _, child) in children
+            if getattr(child, "model", None)
+        }
+        _dispatch_model = (
+            next(iter(_child_models))
+            if len(_child_models) == 1
+            else ("mixed" if _child_models else default_creds.get("model"))
+        )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -2834,7 +2855,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=_dispatch_model,
             session_key=_session_key,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
@@ -2973,7 +2994,11 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_delegation_credentials(
+    cfg: dict,
+    parent_agent,
+    model_override: Optional[Any] = None,
+) -> dict:
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct
@@ -2999,6 +3024,21 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
+
+    if model_override:
+        if isinstance(model_override, str):
+            configured_model = model_override.strip() or configured_model
+        elif isinstance(model_override, dict):
+            configured_model = str(model_override.get("model") or configured_model or "").strip() or None
+            configured_provider = str(model_override.get("provider") or configured_provider or "").strip() or None
+            configured_base_url = str(model_override.get("base_url") or configured_base_url or "").strip() or None
+            configured_api_key = str(model_override.get("api_key") or configured_api_key or "").strip() or None
+            configured_api_mode = str(model_override.get("api_mode") or configured_api_mode or "").strip().lower() or None
+        else:
+            raise ValueError(
+                "model override must be either a model string or an object "
+                "with at least {'model': '<name>'}."
+            )
 
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
     # wire protocol — they cannot be reached via OpenAI chat_completions against
@@ -3238,7 +3278,10 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- Subagent model CAN be selected per call with model={provider, model}; "
+        "use this only when the user or routing policy explicitly calls for a "
+        "different worker model. Otherwise children inherit the parent model "
+        "or the delegation.provider / delegation.model config override.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )

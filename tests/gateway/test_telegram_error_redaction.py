@@ -23,7 +23,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import TelegramAdapter, _redact_telegram_error_text
 
 _SECRET_TOKEN = "123456789:AAFakeSecretTelegramBotTokenABCDEFGHIJ"
 _SECRET_URL = f"https://api.telegram.org/bot{_SECRET_TOKEN}/getMe"
@@ -41,6 +41,17 @@ def _make_connected_adapter() -> TelegramAdapter:
     bot.send_chat_action = AsyncMock()
     adapter._bot = bot
     return adapter
+
+
+def test_empty_transport_exception_renders_exception_class():
+    """Empty exception strings should still leave useful diagnostic detail.
+
+    ``asyncio.TimeoutError`` and some httpx/PTB transport wrappers stringify to
+    ``""``; logging them directly produced ``()`` / blank ``Error:`` fields in
+    gateway logs, which made heartbeat reconnects impossible to classify from
+    log context alone.
+    """
+    assert _redact_telegram_error_text(TimeoutError()) == "TimeoutError"
 
 
 @pytest.mark.asyncio

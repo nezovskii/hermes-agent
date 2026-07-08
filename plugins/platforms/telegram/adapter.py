@@ -26,7 +26,9 @@ def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
     if not text:
-        return text
+        if error is None:
+            return text
+        return error.__class__.__name__
     try:
         from agent.redact import redact_sensitive_text
 
@@ -115,6 +117,33 @@ async def _run_abandon_cleanup(on_abandon) -> None:
         logger.debug("Abandoned Telegram init cleanup failed", exc_info=True)
 
 
+async def _force_close_app_transports(app) -> None:
+    """Directly close a PTB app's httpx request transports.
+
+    ``HTTPXRequest`` builds its ``httpx.AsyncClient`` eagerly in its constructor
+    and its ``shutdown()`` gates only on ``client.is_closed`` — unlike
+    ``Application.shutdown()`` / ``Bot.shutdown()``, which are gated on the app's
+    ``_initialized`` / ``_requests_initialized`` flags and therefore no-op (and
+    leak the connection pool) when the app was never fully initialized. Closing
+    the request transports directly releases the pool regardless of PTB init
+    state. Best-effort; all failures swallowed.
+    """
+    bot = getattr(app, "bot", None) if app is not None else None
+    requests = getattr(bot, "_request", None) if bot is not None else None
+    if not requests:
+        return
+    for request in requests:
+        shutdown = getattr(request, "shutdown", None)
+        if shutdown is None:
+            continue
+        try:
+            result = shutdown()
+            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                await result
+        except Exception:
+            logger.debug("Telegram request transport shutdown failed", exc_info=True)
+
+
 async def _shutdown_abandoned_app(app) -> None:
     """Release a half-built PTB app's httpx transports after init was abandoned.
 
@@ -137,20 +166,7 @@ async def _shutdown_abandoned_app(app) -> None:
     # Directly close the underlying request transports (bypasses PTB's
     # init-gated shutdown so the eagerly-built httpx pool is released even when
     # the abandoned initialize() never flipped _initialized).
-    bot = getattr(app, "bot", None)
-    requests = getattr(bot, "_request", None) if bot is not None else None
-    if not requests:
-        return
-    for request in requests:
-        shutdown = getattr(request, "shutdown", None)
-        if shutdown is None:
-            continue
-        try:
-            result = shutdown()
-            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
-                await result
-        except Exception:
-            logger.debug("Abandoned Telegram request shutdown failed", exc_info=True)
+    await _force_close_app_transports(app)
 
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
@@ -546,6 +562,13 @@ class TelegramAdapter(BasePlatformAdapter):
         self._media_batch_delay_seconds = env_float("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", 0.8)
         self._pending_photo_batches: Dict[str, MessageEvent] = {}
         self._pending_photo_batch_tasks: Dict[str, asyncio.Task] = {}
+        # Optional document burst batching for workflows where users upload many
+        # PDFs/files back-to-back (labs, books, trading exports). Kept opt-in so
+        # single document uploads retain the historical immediate path unless a
+        # profile explicitly enables batching.
+        self._document_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_DOCUMENT_BATCH_DELAY_SECONDS", "0"))
+        self._pending_document_batches: Dict[str, MessageEvent] = {}
+        self._pending_document_batch_tasks: Dict[str, asyncio.Task] = {}
         self._media_group_events: Dict[str, MessageEvent] = {}
         self._media_group_tasks: Dict[str, asyncio.Task] = {}
         # Buffer rapid text messages so Telegram client-side splits of long
@@ -2204,9 +2227,10 @@ class TelegramAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 return
             except (asyncio.TimeoutError, OSError) as probe_err:
+                safe_probe_error = _redact_telegram_error_text(probe_err)
                 logger.warning(
                     "[%s] Polling heartbeat probe failed (%s); triggering reconnect",
-                    self.name, probe_err,
+                    self.name, safe_probe_error,
                 )
                 if self._polling_error_task and not self._polling_error_task.done():
                     continue   # reconnect already in progress
@@ -2360,9 +2384,10 @@ class TelegramAdapter(BasePlatformAdapter):
             await asyncio.wait_for(self._app.bot.get_me(), PROBE_TIMEOUT)
             self._send_path_degraded = False
         except Exception as probe_err:
+            safe_probe_error = _redact_telegram_error_text(probe_err)
             logger.warning(
                 "[%s] Polling heartbeat probe failed %ds after reconnect: %s",
-                self.name, HEARTBEAT_PROBE_DELAY, probe_err,
+                self.name, HEARTBEAT_PROBE_DELAY, safe_probe_error,
             )
             await self._handle_polling_network_error(probe_err)
 
@@ -2920,16 +2945,17 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommandScopeAllGroupChats,
                     BotCommandScopeDefault,
                 )
-                from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
+                from hermes_cli.commands import telegram_menu_max_commands
                 if not self._bot:
                     return
                 # Telegram allows up to 100 commands but has an undocumented
                 # payload size limit (~4KB total).  Hermes defaults to 60 to
                 # keep built-ins plus common skill commands visible while
                 # staying under the threshold; users can tune the cap via
-                # platforms.telegram.extra.command_menu.
+                # platforms.telegram.extra.command_menu. Profile quick commands
+                # are prioritized within the same cap.
                 max_commands = telegram_menu_max_commands()
-                menu_commands, hidden_count = telegram_menu_commands(max_commands=max_commands)
+                menu_commands, hidden_count = self._telegram_menu_commands(max_commands)
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 # Register for all scopes independently — Telegram picks the
                 # narrowest matching scope per chat type (forum topics fall
@@ -2980,6 +3006,49 @@ class TelegramAdapter(BasePlatformAdapter):
         finally:
             if self._post_connect_task is asyncio.current_task():
                 self._post_connect_task = None
+
+    def _telegram_menu_commands(self, max_commands: int) -> tuple[list[tuple[str, str]], int]:
+        """Return Telegram menu commands, prioritizing profile quick commands.
+
+        Telegram's slash menu is capped in this adapter to avoid Bot API payload
+        limits. Profile quick commands are explicit user-facing shortcuts, so
+        keep them visible ahead of the generic built-in menu.
+        """
+        from hermes_cli.commands import telegram_menu_commands
+
+        menu_commands, hidden_count = telegram_menu_commands(max_commands=max_commands)
+        quick_entries: list[tuple[str, str]] = []
+        try:
+            from hermes_constants import get_hermes_home
+            import yaml as _yaml
+
+            config_path = get_hermes_home() / "config.yaml"
+            cfg = _yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            quick_commands = cfg.get("quick_commands") or {}
+            if isinstance(quick_commands, dict):
+                for raw_name, qcmd in quick_commands.items():
+                    if not isinstance(raw_name, str) or not isinstance(qcmd, dict):
+                        continue
+                    name = re.sub(r"[^a-z0-9_]", "_", raw_name.lower()).strip("_")[:32]
+                    if not name:
+                        continue
+                    desc = str(qcmd.get("description") or qcmd.get("target") or qcmd.get("type") or "Quick command")
+                    quick_entries.append((name, desc[:40] or "Quick command"))
+        except Exception as e:
+            logger.debug("[%s] Could not load quick commands for Telegram menu: %s", self.name, e)
+
+        if not quick_entries:
+            return menu_commands, hidden_count
+
+        seen: set[str] = set()
+        merged: list[tuple[str, str]] = []
+        for name, desc in quick_entries + menu_commands:
+            if name in seen:
+                continue
+            seen.add(name)
+            merged.append((name, desc))
+        overflow = max(0, len(merged) - max_commands)
+        return merged[:max_commands], hidden_count + overflow
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
@@ -3436,6 +3505,8 @@ class TelegramAdapter(BasePlatformAdapter):
             collect(task)
         for task in list(self._pending_photo_batch_tasks.values()):
             collect(task)
+        for task in list(getattr(self, "_pending_document_batch_tasks", {}).values()):
+            collect(task)
         for task in list(self._pending_text_batch_tasks.values()):
             collect(task)
         collect(self._polling_error_task)
@@ -3449,6 +3520,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._media_group_events.clear()
         self._pending_photo_batch_tasks.clear()
         self._pending_photo_batches.clear()
+        if hasattr(self, "_pending_document_batch_tasks"):
+            self._pending_document_batch_tasks.clear()
+        if hasattr(self, "_pending_document_batches"):
+            self._pending_document_batches.clear()
         self._pending_text_batch_tasks.clear()
         self._pending_text_batches.clear()
         if self._polling_error_task is not current_task:
@@ -3517,7 +3592,17 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] Error during Telegram disconnect: %s",
                     self.name, _redact_telegram_error_text(e),
                 )
+            finally:
+                # ``app.shutdown()`` above is gated on PTB's init flags and
+                # no-ops (leaking the httpx pool) when the app never finished
+                # initialize() — e.g. an adapter torn down mid-reconnect, or one
+                # whose updater.stop() timed out above. Force-close the request
+                # transports directly so the connection pool is always released;
+                # otherwise orphaned pools accumulate ESTABLISHED sockets across
+                # reconnect churn until the process hits EMFILE (#too-many-fds).
+                await _force_close_app_transports(self._app)
         self._release_platform_lock()
+
 
         self._app = None
         self._bot = None
@@ -7456,8 +7541,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 if chat_id in self._forum_command_registered:
                     return
                 from telegram import BotCommand, BotCommandScopeChat
-                from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
-                menu_commands, _ = telegram_menu_commands(max_commands=telegram_menu_max_commands())
+                from hermes_cli.commands import telegram_menu_max_commands
+                menu_commands, _ = self._telegram_menu_commands(telegram_menu_max_commands())
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
                 self._forum_command_registered.add(chat_id)
@@ -7733,6 +7818,47 @@ class TelegramAdapter(BasePlatformAdapter):
             prior_task.cancel()
 
         self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(self._flush_photo_batch(batch_key))
+
+    def _document_batch_key(self, event: MessageEvent) -> str:
+        """Return a batching key for rapid non-album Telegram documents."""
+        from gateway.session import build_session_key
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        return f"{session_key}:document-burst"
+
+    async def _flush_document_batch(self, batch_key: str) -> None:
+        """Send a buffered document burst as a single MessageEvent."""
+        current_task = asyncio.current_task()
+        try:
+            await asyncio.sleep(self._document_batch_delay_seconds)
+            event = self._pending_document_batches.pop(batch_key, None)
+            if not event:
+                return
+            logger.info("[Telegram] Flushing document batch %s with %d file(s)", batch_key, len(event.media_urls))
+            await self.handle_message(event)
+        finally:
+            if self._pending_document_batch_tasks.get(batch_key) is current_task:
+                self._pending_document_batch_tasks.pop(batch_key, None)
+
+    def _enqueue_document_event(self, batch_key: str, event: MessageEvent) -> None:
+        """Merge document events into a pending batch and schedule flush."""
+        existing = self._pending_document_batches.get(batch_key)
+        if existing is None:
+            self._pending_document_batches[batch_key] = event
+        else:
+            existing.media_urls.extend(event.media_urls)
+            existing.media_types.extend(event.media_types)
+            if event.text:
+                existing.text = self._merge_caption(existing.text, event.text)
+
+        prior_task = self._pending_document_batch_tasks.get(batch_key)
+        if prior_task and not prior_task.done():
+            prior_task.cancel()
+
+        self._pending_document_batch_tasks[batch_key] = asyncio.create_task(self._flush_document_batch(batch_key))
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
@@ -8011,6 +8137,14 @@ class TelegramAdapter(BasePlatformAdapter):
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
             await self._queue_media_group_event(str(media_group_id), event)
+            return
+
+        if (
+            msg_type == MessageType.DOCUMENT
+            and event.media_urls
+            and self._document_batch_delay_seconds > 0
+        ):
+            self._enqueue_document_event(self._document_batch_key(event), event)
             return
 
         await self.handle_message(event)

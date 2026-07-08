@@ -62,6 +62,26 @@ def _make_mock_parent(depth=0):
 
 
 class TestDelegateRequirements(unittest.TestCase):
+    def _assert_model_override_schema_shape(self, model_schema: dict) -> None:
+        variants = model_schema.get("oneOf", [])
+        self_types = {variant.get("type") for variant in variants}
+        self.assertIn("string", self_types)
+        self.assertIn("object", self_types)
+
+        object_variant = next(
+            variant for variant in variants if variant.get("type") == "object"
+        )
+        self.assertEqual(object_variant.get("required"), ["model"])
+        self.assertEqual(
+            set(object_variant["properties"].keys()),
+            {"provider", "model", "base_url", "api_mode", "api_key"},
+        )
+        for field in ("provider", "model", "base_url", "api_mode", "api_key"):
+            self.assertEqual(
+                object_variant["properties"][field]["type"],
+                "string",
+            )
+
     def test_always_available(self):
         self.assertTrue(check_delegate_requirements())
 
@@ -1097,6 +1117,43 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIsNone(creds["base_url"])
         self.assertIsNone(creds["api_key"])
 
+    def test_per_call_model_string_override_keeps_parent_credentials(self):
+        parent = _make_mock_parent(depth=0)
+        cfg = {"model": "", "provider": ""}
+        creds = _resolve_delegation_credentials(
+            cfg, parent, model_override="gpt-5.3-codex-spark"
+        )
+        self.assertEqual(creds["model"], "gpt-5.3-codex-spark")
+        self.assertIsNone(creds["provider"])
+        self.assertIsNone(creds["base_url"])
+        self.assertIsNone(creds["api_key"])
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_per_call_model_object_override_resolves_provider(self, mock_resolve):
+        mock_resolve.return_value = {
+            "provider": "openai-codex",
+            "model": "gpt-5.3-codex-spark",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "oauth-token",
+            "api_mode": "codex_responses",
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {"model": "", "provider": ""}
+        creds = _resolve_delegation_credentials(
+            cfg,
+            parent,
+            model_override={
+                "provider": "openai-codex",
+                "model": "gpt-5.3-codex-spark",
+            },
+        )
+        self.assertEqual(creds["provider"], "openai-codex")
+        self.assertEqual(creds["model"], "gpt-5.3-codex-spark")
+        self.assertEqual(creds["api_mode"], "codex_responses")
+        mock_resolve.assert_called_once_with(
+            requested="openai-codex", target_model="gpt-5.3-codex-spark"
+        )
+
 
 
     def test_direct_endpoint_uses_configured_base_url_and_api_key(self):
@@ -1384,6 +1441,62 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["base_url"], "https://openrouter.ai/api/v1")
             self.assertEqual(kwargs["api_key"], "sk-or-delegation-key")
             self.assertEqual(kwargs["api_mode"], "chat_completions")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_per_task_model_override_reaches_child_agent(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {"max_iterations": 45, "model": "", "provider": ""}
+
+        def _creds(_cfg, _parent, model_override=None):
+            if isinstance(model_override, dict) and model_override.get("model") == "gpt-5.3-codex-spark":
+                return {
+                    "model": "gpt-5.3-codex-spark",
+                    "provider": "openai-codex",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "api_key": "spark-token",
+                    "api_mode": "codex_responses",
+                }
+            return {
+                "model": None,
+                "provider": None,
+                "base_url": None,
+                "api_key": None,
+                "api_mode": None,
+            }
+
+        mock_creds.side_effect = _creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                tasks=[
+                    {
+                        "goal": "fast patch",
+                        "model": {
+                            "provider": "openai-codex",
+                            "model": "gpt-5.3-codex-spark",
+                        },
+                    },
+                    {"goal": "default worker"},
+                ],
+                parent_agent=parent,
+            )
+
+            first_kwargs = MockAgent.call_args_list[0].kwargs
+            second_kwargs = MockAgent.call_args_list[1].kwargs
+            self.assertEqual(first_kwargs["model"], "gpt-5.3-codex-spark")
+            self.assertEqual(first_kwargs["provider"], "openai-codex")
+            self.assertEqual(first_kwargs["api_mode"], "codex_responses")
+            self.assertEqual(second_kwargs["model"], parent.model)
+            self.assertEqual(second_kwargs["provider"], parent.provider)
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -2123,7 +2236,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
             # Long enough to exceed the OLD idle threshold (5 cycles) at
             # the patched interval, but shorter than the new in-tool
             # threshold.
-            time.sleep(0.4)
+            time.sleep(0.8)
             return {"final_response": "done", "completed": True, "api_calls": 1}
 
         child.run_conversation.side_effect = slow_run
@@ -2148,7 +2261,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         self.assertGreater(
             len(touch_calls), 2,
             f"Heartbeat stopped too early while child was inside a tool; "
-            f"got {len(touch_calls)} touches over 0.4s at 0.05s interval",
+            f"got {len(touch_calls)} touches over 0.8s at 0.05s interval",
         )
 
 
