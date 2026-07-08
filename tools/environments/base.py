@@ -361,7 +361,12 @@ class BaseEnvironment(ABC):
         # Restore configured cwd after login shell profile scripts, which may
         # change the working directory (e.g. bashrc `cd ~`).  Without this,
         # pwd -P captures the profile's directory, not terminal.cwd.
-        _quoted_cwd = shlex.quote(self.cwd)
+        # Route through ``_quote_cwd_for_cd`` (not a bare ``shlex.quote``) so
+        # the Windows subclass override converts a native ``C:\Users\x`` cwd to
+        # the Git-Bash ``/c/Users/x`` form the bootstrap ``cd`` can resolve.
+        # Without this the snapshot bootstrap ``cd`` below fails on Windows and
+        # ``pwd -P`` captures the login shell's directory, not ``terminal.cwd``.
+        _quoted_cwd = self._quote_cwd_for_cd(self.cwd)
         # Quote the snapshot / cwd-file paths so Git Bash on Windows handles
         # ``C:/Users/...``-shaped paths without glob-splitting the colon or
         # tripping on drive letters.  On POSIX this is a no-op (no colons /
@@ -413,7 +418,7 @@ class BaseEnvironment(ABC):
             # Publish atomically only if assembly succeeded; otherwise drop the
             # partial temp rather than leave it to be sourced or orphaned.
             f"mv -f {_snap_tmp} {_quoted_snap} || rm -f {_snap_tmp}\n"
-            f"builtin cd {_quoted_cwd} 2>/dev/null || true\n"
+            f"builtin cd -- {_quoted_cwd} 2>/dev/null || true\n"
             f"pwd -P > {_quoted_cwd_file} 2>/dev/null || true\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
@@ -718,6 +723,14 @@ class BaseEnvironment(ABC):
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
+                    # Close the pipe read-end on this early-return path too;
+                    # only the natural-exit path closed it before, leaking one
+                    # fd per interrupted command (idempotent — safe if already
+                    # closed / None).
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
                     return {
                         "output": "".join(output_chunks) + "\n[Command interrupted]",
                         "returncode": 130,
@@ -731,6 +744,12 @@ class BaseEnvironment(ABC):
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
+                    # Close the pipe read-end on the timeout path (previously
+                    # leaked one fd per timed-out command).
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
                     partial = "".join(output_chunks)
                     timeout_msg = f"\n[Command timed out after {timeout}s]"
                     return {
@@ -789,6 +808,12 @@ class BaseEnvironment(ABC):
             try:
                 self._kill_process(proc)
                 drain_thread.join(timeout=2)
+                # Close the pipe read-end before propagating so a
+                # SIGTERM/SIGINT during a command doesn't leak an fd.
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
             except Exception:
                 pass  # cleanup is best-effort
             raise
