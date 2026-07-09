@@ -2795,7 +2795,7 @@ def run_conversation(
                     if agent._try_activate_fallback(classified.reason):
                         retry_count = 0
                         compression_attempts = 0
-                        primary_recovery_attempted = False
+                        _retry.primary_recovery_attempted = False
                         continue
 
                 if (
