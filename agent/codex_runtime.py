@@ -839,7 +839,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
-        agent._codex_stream_last_event_ts = time.time()
+        # Monotonic clock: the stale-event watchdog compares this against
+        # time.monotonic() and must not be skewed by NTP/suspend wall-clock
+        # jumps. This callback runs in the worker thread; under GIL pressure it
+        # may be starved and fail to refresh, which the poll loop's stall guard
+        # compensates for. See interruptible_api_call in chat_completion_helpers.
+        agent._codex_stream_last_event_ts = time.monotonic()
         agent._touch_activity("receiving stream response")
 
     def _interrupt_check() -> bool:

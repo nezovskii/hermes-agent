@@ -133,7 +133,8 @@ def test_ttfb_default_tolerates_slow_first_event(tmp_path, monkeypatch):
         # well under the 120s default cutoff. Mark the first byte so the
         # no-byte detector sees activity, then return the response.
         time.sleep(2.0)
-        agent._codex_stream_last_event_ts = time.time()
+        # _on_event writes the monotonic clock in production; simulate faithfully.
+        agent._codex_stream_last_event_ts = time.monotonic()
         return sentinel
 
     monkeypatch.setattr(agent, "_run_codex_stream", fake_slow_first_event)
@@ -258,7 +259,8 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     def fake_stream(api_kwargs, client=None, on_first_delta=None):
         # Bytes flowing: mark stream activity right away, then keep generating
         # past the 1s TTFB cutoff before returning a real response.
-        agent._codex_stream_last_event_ts = time.time()
+        # _on_event writes the monotonic clock in production; simulate faithfully.
+        agent._codex_stream_last_event_ts = time.monotonic()
         if on_first_delta:
             on_first_delta()
         time.sleep(2.0)
@@ -298,7 +300,8 @@ def test_event_idle_kills_after_first_event_then_silence(tmp_path, monkeypatch):
     stop = {"flag": False}
 
     def fake_stream(api_kwargs, client=None, on_first_delta=None):
-        agent._codex_stream_last_event_ts = time.time()
+        # _on_event writes the monotonic clock in production; simulate faithfully.
+        agent._codex_stream_last_event_ts = time.monotonic()
         deadline = time.time() + 30
         while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
             time.sleep(0.02)
@@ -384,6 +387,109 @@ def test_large_codex_request_waits_instead_of_ttfb_reconnect(tmp_path, monkeypat
     resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": large_input})
     assert resp is sentinel
     assert "codex_ttfb_kill" not in closes
+
+
+def test_stall_forgiveness_prevents_false_idle_kill(tmp_path, monkeypatch):
+    """A GIL/suspend stall (a large monotonic jump between poll iterations) must
+    NOT be counted as stream inactivity. The poll loop's stall guard detects the
+    starved iteration and advances the last-event timestamp, so a healthy stream
+    is not killed and re-issued (which would be a duplicate full-context POST).
+    """
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "10")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "3")
+    monkeypatch.setenv("HERMES_CODEX_STALL_FORGIVE", "1")
+    monkeypatch.setenv("HERMES_CODEX_STALL_FORGIVE_THRESHOLD_SECONDS", "2")
+
+    closes: list = []
+    statuses: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(agent, "_buffer_status", lambda m: statuses.append(m))
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client", lambda c, reason=None: closes.append(reason)
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client", lambda c, reason=None: closes.append(reason)
+    )
+
+    # Controllable monotonic clock: real time + an injectable offset so we can
+    # simulate a multi-second stall deterministically without sleeping that long.
+    _real_monotonic = time.monotonic
+    offset = {"v": 0.0}
+    monkeypatch.setattr(h.time, "monotonic", lambda: _real_monotonic() + offset["v"])
+
+    sentinel = SimpleNamespace(ok=True)
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        # First SSE event arrives with offset still 0.
+        agent._codex_stream_last_event_ts = h.time.monotonic()
+        if on_first_delta:
+            on_first_delta()
+        time.sleep(0.5)       # a couple of normal poll iterations
+        offset["v"] = 10.0    # simulate a ~10s GIL stall / host suspend
+        time.sleep(0.7)       # keep the worker alive so the poll loop observes it
+        return sentinel
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+
+    resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+    assert resp is sentinel
+    assert "codex_stream_idle_kill" not in closes
+
+
+def test_stall_forgiveness_disabled_allows_idle_kill(tmp_path, monkeypatch):
+    """Control for the test above: with HERMES_CODEX_STALL_FORGIVE=0 the same
+    monotonic jump is (by explicit opt-out) treated as stream inactivity and the
+    idle watchdog kills the connection — proving the guard is what prevents it.
+    """
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "10")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "3")
+    monkeypatch.setenv("HERMES_CODEX_STALL_FORGIVE", "0")
+
+    closes: list = []
+    statuses: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(agent, "_buffer_status", lambda m: statuses.append(m))
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client", lambda c, reason=None: closes.append(reason)
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client", lambda c, reason=None: closes.append(reason)
+    )
+
+    _real_monotonic = time.monotonic
+    offset = {"v": 0.0}
+    monkeypatch.setattr(h.time, "monotonic", lambda: _real_monotonic() + offset["v"])
+
+    stop = {"flag": False}
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        agent._codex_stream_last_event_ts = h.time.monotonic()
+        if on_first_delta:
+            on_first_delta()
+        time.sleep(0.5)
+        offset["v"] = 10.0    # ~10s jump; with forgiveness off this reads as idle
+        deadline = time.time() + 30
+        while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+        assert "after first byte" in str(excinfo.value)
+        assert "codex_stream_idle_kill" in closes
+    finally:
+        stop["flag"] = True
 
 
 def test_large_codex_request_strict_ttfb_env_still_reconnects(tmp_path, monkeypatch):

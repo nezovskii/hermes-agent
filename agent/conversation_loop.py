@@ -2978,17 +2978,36 @@ def run_conversation(
                 agent._touch_activity(
                     f"API error recovery (attempt {retry_count}/{max_retries})"
                 )
-                
+
+                # Usage visibility: a transport retry re-issues the FULL request
+                # (entire context, e.g. ~168k tokens) but does NOT advance the
+                # api_calls=N/M budget counter — that increments once per outer
+                # loop iteration, not per transport retry. Watchdog false-kills
+                # (GIL-stall induced) and genuine connection errors both land
+                # here. Left invisible, these duplicates inflate provider/token
+                # usage while the api_calls line looks flat, so count and surface
+                # them.
+                agent._api_transport_reissue_total = getattr(
+                    agent, "_api_transport_reissue_total", 0
+                ) + 1
+                _reissue_msg_count = (
+                    len(api_messages) if isinstance(api_messages, list) else "?"
+                )
+
                 error_type = type(api_error).__name__
                 error_msg = str(api_error).lower()
                 _error_summary = agent._summarize_api_error(api_error)
                 logger.warning(
-                    "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
+                    "API call failed (attempt %s/%s) error_type=%s %s summary=%s "
+                    "— re-issuing full context (msgs=%s; NOT counted in api_calls "
+                    "budget; session reissue_total=%s)",
                     retry_count,
                     max_retries,
                     error_type,
                     agent._client_log_context(),
                     _error_summary,
+                    _reissue_msg_count,
+                    agent._api_transport_reissue_total,
                 )
 
                 _provider = getattr(agent, "provider", "unknown")

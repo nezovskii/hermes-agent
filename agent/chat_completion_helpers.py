@@ -96,18 +96,24 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
         return _message_chars(api_payload) // 4
 
     if isinstance(api_payload, dict):
+        # ``_message_chars`` iterates list items and sums ``len(str(item))``
+        # per item. For the big ``input``/``tools`` lists that is functionally
+        # the same magnitude as ``len(str(whole_list))`` but bounds peak
+        # allocation to one item — the old ``_chars(list)`` built a full string
+        # repr of the entire ~168k-token list on every call just to pick a
+        # watchdog timeout tier (gratuitous per-call CPU/allocation under GIL).
         messages = api_payload.get("messages")
         if isinstance(messages, list):
             total_chars = _message_chars(messages)
             if "tools" in api_payload:
-                total_chars += _chars(api_payload.get("tools"))
+                total_chars += _message_chars(api_payload.get("tools"))
             return total_chars // 4
 
         if "input" in api_payload:
             total_chars = (
-                _chars(api_payload.get("input"))
+                _message_chars(api_payload.get("input"))
                 + _chars(api_payload.get("instructions"))
-                + _chars(api_payload.get("tools"))
+                + _message_chars(api_payload.get("tools"))
             )
             return total_chars // 4
 
@@ -456,8 +462,31 @@ def interruptible_api_call(agent, api_kwargs: dict):
         agent._codex_stream_last_event_ts = None
         agent._codex_stream_last_progress_ts = None
 
-    _call_start = time.time()
+    # Monotonic clock for all watchdog timing below: elapsed and the SSE-gap
+    # must not be skewed by NTP steps or host suspend/resume wall-clock jumps.
+    _call_start = time.monotonic()
     agent._touch_activity("waiting for non-streaming API response")
+
+    # Stall-forgiveness guard. The watchdogs below judge provider liveness from
+    # elapsed time and the gap since the last SSE event (refreshed by _on_event
+    # in the worker thread). Under GIL pressure (serializing/decoding a 100k+
+    # token context, a concurrent background-review turn) or a host suspend, this
+    # poll thread AND the worker thread can be starved for many seconds while the
+    # socket is alive and buffering data. Attributing that frozen wall-clock to
+    # provider inactivity false-kills a healthy stream and forces a brand-new
+    # full-context POST — billable, and NOT counted against the api_calls budget.
+    # We detect a starved poll iteration (a join(0.3s) that actually took far
+    # longer than 0.3s) and forgive the frozen interval so the watchdogs judge
+    # only time we were actually able to observe the stream. Kill-switch:
+    # HERMES_CODEX_STALL_FORGIVE=0.
+    _stall_forgive_enabled = os.environ.get(
+        "HERMES_CODEX_STALL_FORGIVE", "1"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    _stall_forgive_threshold = _env_float(
+        "HERMES_CODEX_STALL_FORGIVE_THRESHOLD_SECONDS", 3.0
+    )
+    _stall_forgiveness = 0.0
+    _prev_poll_ts = _call_start
 
     t = threading.Thread(target=_call, daemon=True)
     t.start()
@@ -466,15 +495,34 @@ def interruptible_api_call(agent, api_kwargs: dict):
         t.join(timeout=0.3)
         _poll_count += 1
 
+        _now = time.monotonic()
+        _poll_gap = _now - _prev_poll_ts
+        _prev_poll_ts = _now
+        # A single join(0.3) that took >> 0.3s means this thread was starved
+        # (GIL/suspend), not that the provider went quiet. Forgive the excess so
+        # neither the elapsed timers nor the SSE-gap detector misfire and force
+        # an unnecessary full-context reconnect.
+        if _stall_forgive_enabled and _poll_gap > _stall_forgive_threshold:
+            _stall_delta = _poll_gap - 0.3
+            _stall_forgiveness += _stall_delta
+            _last_ts = getattr(agent, "_codex_stream_last_event_ts", None)
+            if _last_ts is not None:
+                agent._codex_stream_last_event_ts = _last_ts + _stall_delta
+            logger.warning(
+                "Codex poll loop stalled %.1fs (GIL/suspend suspected); forgiving "
+                "%.1fs for stream watchdogs to avoid a false reconnect.",
+                _poll_gap, _stall_delta,
+            )
+
         # Touch activity every ~30s so the gateway's inactivity
         # monitor knows we're alive while waiting for the response.
         if _poll_count % 100 == 0:  # 100 × 0.3s = 30s
-            _elapsed = time.time() - _call_start
+            _elapsed = (_now - _call_start) - _stall_forgiveness
             agent._touch_activity(
                 f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
             )
 
-        _elapsed = time.time() - _call_start
+        _elapsed = (_now - _call_start) - _stall_forgiveness
 
         # TTFB detector: the Codex stream has produced no event at all and
         # we're past the first-byte cutoff → the backend opened the
@@ -541,9 +589,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
         if (
             _codex_idle_enabled
             and _last_codex_event_ts is not None
-            and (time.time() - _last_codex_event_ts) > _codex_idle_timeout
+            and (_now - _last_codex_event_ts) > _codex_idle_timeout
         ):
-            _event_stale_elapsed = time.time() - _last_codex_event_ts
+            _event_stale_elapsed = _now - _last_codex_event_ts
             logger.warning(
                 "Codex stream produced no SSE events for %.0fs after first byte "
                 "(threshold %.0fs, model=%s, context=~%s tokens). Killing "
@@ -576,7 +624,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # Stale-call detector: kill the connection if no response
         # arrives within the configured timeout.
         if _elapsed > _stale_timeout:
-            _est_ctx = estimate_request_context_tokens(api_kwargs)
+            # Reuse the estimate computed once before the worker started rather
+            # than re-walking the full ~168k-token payload on the stale path.
+            _est_ctx = _est_tokens_for_codex_watchdog
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
             if callable(_hint_fn):
