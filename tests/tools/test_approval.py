@@ -1452,6 +1452,23 @@ class TestLaunchctlGatewayLifecycle:
         dangerous, _, _ = detect_dangerous_command(cmd)
         assert dangerous is True
 
+    def test_launchctl_submit_hermes_detected(self):
+        """`launchctl submit` registers a new launchd job; submitted with the
+        KeepAlive default it turns a run-once restart helper into an infinite
+        SIGTERM loop (2026-07-08 incident). Must require approval."""
+        cmd = (
+            "launchctl submit -l ai.hermes.rehome-kanban-dispatcher-1783505635 "
+            "-- /bin/bash /Users/x/.hermes/scripts/rehome.sh"
+        )
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_launchctl_submit_unrelated_not_flagged(self):
+        """`launchctl submit` on a non-Hermes label is out of scope."""
+        cmd = "launchctl submit -l com.example.oneshot -- /bin/echo hi"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
     def test_launchctl_print_unrelated_not_flagged(self):
         """Read-only inspection of an unrelated launchd label must stay safe."""
         cmd = "launchctl print system/com.apple.WindowServer"

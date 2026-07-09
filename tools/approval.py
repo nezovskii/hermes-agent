@@ -649,8 +649,12 @@ DANGEROUS_PATTERNS = [
     # launchctl-driven gateway stop/restart on macOS. The agent can bypass
     # the `hermes gateway stop|restart` pattern above by driving launchd
     # directly against the service label (commonly `ai.hermes.gateway`).
-    # Catch the operations that stop, restart, or unload it.
-    (r'\blaunchctl\s+(stop|kickstart|bootout|unload|kill|disable|remove)\b.*\b(hermes|ai\.hermes)\b', "stop/restart hermes launchd service (kills running agents)"),
+    # Catch the operations that stop, restart, or unload it — plus `submit`,
+    # which registers a NEW launchd job. `launchctl submit` defaults to
+    # KeepAlive=true, so a run-once helper (e.g. one ending in
+    # `kickstart -k ai.hermes.gateway`) silently becomes an infinite SIGTERM
+    # restart loop; two such stuck jobs occurred on 2026-07-08.
+    (r'\blaunchctl\s+(stop|kickstart|bootout|unload|submit|kill|disable|remove)\b.*\b(hermes|ai\.hermes)\b', "stop/restart/submit hermes launchd service (kills running agents or creates a restart-loop job)"),
     # File copy/move/edit into sensitive system paths (/etc/ and macOS
     # /private/etc/ mirror).
     (rf'\b(cp|mv|install)\b.*\s{_SYSTEM_CONFIG_PATH}', "copy/move file into system config path"),

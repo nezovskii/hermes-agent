@@ -20122,6 +20122,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    # Reap stray transient KeepAlive launchd jobs before anything else. These are
+    # run-once maintenance scripts mis-submitted via `launchctl submit` (which
+    # defaults to KeepAlive=true) that end in `launchctl kickstart -k` and so
+    # SIGTERM-loop the gateway every ~20-30s. Sweeping on every boot means an
+    # active loop self-heals within a cycle. Best-effort; never blocks startup.
+    try:
+        from gateway.launchd_janitor import reap_stray_transient_launchd_jobs
+        reap_stray_transient_launchd_jobs()
+    except Exception:
+        pass
+
     # Snapshot the checkout revision now, while sys.modules still matches disk,
     # so a later `git pull` under this long-lived process can be detected (and
     # risky work like model switching refused) instead of crashing on a stale
