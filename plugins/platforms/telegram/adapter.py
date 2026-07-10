@@ -3420,15 +3420,13 @@ class TelegramAdapter(BasePlatformAdapter):
             mode = "webhook" if self._webhook_mode else "polling"
             logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
 
-            # Start the persistent heartbeat loop in polling mode. Webhook mode
-            # receives updates via incoming pushes — there is no long-poll
-            # socket to wedge in CLOSE-WAIT, so the loop is not needed there.
-            if not self._webhook_mode:
-                if self._polling_heartbeat_task and not self._polling_heartbeat_task.done():
-                    self._polling_heartbeat_task.cancel()
-                self._polling_heartbeat_task = asyncio.ensure_future(
-                    self._polling_heartbeat_loop()
-                )
+            # Do not run a synthetic Bot API heartbeat in polling mode. PTB's
+            # getUpdates error callback owns polling liveness, while the
+            # process-level socket guard catches CLOSE_WAIT/FD growth. The old
+            # 90-second get_me() loop used the independent general request pool;
+            # on lossy TLS routes it created fresh sockets and warnings even
+            # while getUpdates was healthy (#31599/#48495).
+            self._polling_heartbeat_task = None
 
             # Command-menu registration, DM-topic setup, and the status
             # indicator each make Bot API calls that can stall for certain
