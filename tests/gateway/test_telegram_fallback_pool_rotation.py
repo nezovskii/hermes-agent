@@ -47,6 +47,26 @@ async def test_fallback_reset_rotates_and_closes_inner_pools(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fallback_reset_fifty_cycles_leaves_only_current_pools_open(monkeypatch):
+    """Repeated clean reconnects must not retain any superseded inner pool."""
+    _RecordingTransport.instances = []
+    monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", _RecordingTransport)
+    transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+
+    for _ in range(50):
+        await transport.reset()
+
+    open_instances = [item for item in _RecordingTransport.instances if not item.closed]
+    closed_instances = [item for item in _RecordingTransport.instances if item.closed]
+    # One primary plus one fallback are current. Every superseded pair is closed.
+    assert len(open_instances) == 2
+    assert len(closed_instances) == 100
+
+    await transport.aclose()
+    assert all(item.closed for item in _RecordingTransport.instances)
+
+
+@pytest.mark.asyncio
 async def test_polling_drain_rotates_fallback_without_rebuilding_ptb_client(monkeypatch):
     _RecordingTransport.instances = []
     monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", _RecordingTransport)

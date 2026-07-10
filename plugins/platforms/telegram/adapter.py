@@ -2104,12 +2104,26 @@ class TelegramAdapter(BasePlatformAdapter):
                     # Refs: NousResearch/hermes-agent#58270
                     await asyncio.wait_for(app.updater.stop(), timeout=_UPDATER_STOP_TIMEOUT)
                 except asyncio.TimeoutError:
-                    logger.warning(
-                        "[%s] updater.stop() timed out during network-error "
-                        "reconnect (likely CLOSE-WAIT socket); forcing drain "
-                        "and restart without clean stop",
-                        self.name,
+                    message = (
+                        "Telegram polling task did not stop cleanly within %.0fs. "
+                        "Restarting the gateway process to release abandoned "
+                        "getUpdates tasks and sockets before polling resumes."
+                        % _UPDATER_STOP_TIMEOUT
                     )
+                    logger.error("[%s] %s", self.name, message)
+                    self._set_fatal_error(
+                        "telegram_polling_stop_timeout",
+                        message,
+                        retryable=True,
+                    )
+                    try:
+                        await self._notify_fatal_error()
+                    except Exception:
+                        logger.exception(
+                            "[%s] Fatal restart notification failed after polling stop timeout",
+                            self.name,
+                        )
+                    return
         except Exception:
             pass
 
@@ -2507,11 +2521,26 @@ class TelegramAdapter(BasePlatformAdapter):
                     try:
                         await asyncio.wait_for(self._app.updater.stop(), timeout=_UPDATER_STOP_TIMEOUT)
                     except asyncio.TimeoutError:
-                        logger.warning(
-                            "[%s] updater.stop() timed out during conflict "
-                            "retry (likely CLOSE-WAIT socket); continuing",
-                            self.name,
+                        message = (
+                            "Telegram polling task did not stop cleanly within %.0fs "
+                            "during conflict recovery. Restarting the gateway process "
+                            "before another getUpdates consumer is created."
+                            % _UPDATER_STOP_TIMEOUT
                         )
+                        logger.error("[%s] %s", self.name, message)
+                        self._set_fatal_error(
+                            "telegram_polling_stop_timeout",
+                            message,
+                            retryable=True,
+                        )
+                        try:
+                            await self._notify_fatal_error()
+                        except Exception:
+                            logger.exception(
+                                "[%s] Fatal restart notification failed after polling stop timeout",
+                                self.name,
+                            )
+                        return
             except Exception:
                 pass
 

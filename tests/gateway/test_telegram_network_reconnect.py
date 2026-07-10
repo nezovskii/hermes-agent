@@ -815,17 +815,16 @@ async def test_schedule_polling_recovery_tracks_background_task():
 
 @pytest.mark.asyncio
 async def test_handle_polling_network_error_updater_stop_timeout():
-    """updater.stop() hanging (CLOSE-WAIT) must not block the reconnect ladder.
+    """An unclean updater stop must restart the process, never add a poller.
 
-    When the underlying TCP connection is in CLOSE-WAIT, PTB's polling task is
-    blocked on epoll on the dead socket.  updater.stop() awaits that task and
-    therefore hangs indefinitely.  The fix wraps stop() in asyncio.wait_for()
-    with a 15-second timeout so the reconnect always advances.
+    A timed-out ``updater.stop()`` means PTB's existing getUpdates task can
+    still own a live response stream. Starting polling again in that state
+    creates a second consumer and leaves the abandoned task's sockets alive;
+    repeated heartbeat recovery then accumulates established Telegram sockets.
 
-    This test simulates the hang by making stop() sleep forever and verifies
-    that _drain_polling_connections() and start_polling() are still called
-    after the timeout fires.
-    Refs: NousResearch/hermes-agent#58270
+    The only safe recovery boundary is process teardown: mark the adapter
+    retryable-fatal, notify the gateway runner, and do not drain/restart polling
+    in-process.
     """
     adapter = _make_adapter()
     adapter._polling_network_error_count = 0
@@ -841,30 +840,22 @@ async def test_handle_polling_network_error_updater_stop_timeout():
     app.updater.stop = _hanging_stop
     app.updater.start_polling = AsyncMock()
     adapter._app = app
-
-    drain_called = []
-
-    async def _fake_drain():
-        drain_called.append(True)
-
-    adapter._drain_polling_connections = _fake_drain
-
-    start_polling_called = []
-
-    async def _fake_start_polling(**kwargs):
-        start_polling_called.append(True)
-
-    app.updater.start_polling = AsyncMock(side_effect=_fake_start_polling)
+    adapter._drain_polling_connections = AsyncMock()
+    adapter._notify_fatal_error = AsyncMock(
+        side_effect=RuntimeError("runner callback failed")
+    )
 
     # Shrink the stop() watchdog bound so the test completes fast instead of
-    # waiting the full _UPDATER_STOP_TIMEOUT. Patching the named constant is
-    # cleaner than monkeypatching asyncio.wait_for process-wide.
+    # waiting the full _UPDATER_STOP_TIMEOUT.
     import plugins.platforms.telegram.adapter as _mod
 
     with patch.object(_mod, "_UPDATER_STOP_TIMEOUT", 0.05):
-        await adapter._handle_polling_network_error(OSError("CLOSE-WAIT test"))
+        await adapter._handle_polling_network_error(OSError("stuck poller test"))
 
-    # The reconnect ladder must have advanced past the hung stop().
-    assert drain_called, "_drain_polling_connections was not called after stop() timeout"
-    assert start_polling_called, "start_polling was not called after stop() timeout"
+    assert adapter.has_fatal_error is True
+    assert adapter.fatal_error_code == "telegram_polling_stop_timeout"
+    assert adapter.fatal_error_retryable is True
+    adapter._notify_fatal_error.assert_awaited_once()
+    adapter._drain_polling_connections.assert_not_awaited()
+    app.updater.start_polling.assert_not_awaited()
 

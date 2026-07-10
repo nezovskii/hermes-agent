@@ -684,3 +684,38 @@ async def test_conflict_callback_disarms_before_scheduling(monkeypatch):
         await asyncio.sleep(0)
     await _cancel_heartbeat(adapter)
 
+
+@pytest.mark.asyncio
+async def test_conflict_stop_timeout_restarts_process_without_new_poller(monkeypatch):
+    """A conflict retry cannot start polling after an unclean updater stop."""
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._polling_conflict_count = 0
+
+    async def hanging_stop():
+        await asyncio.Event().wait()
+
+    updater = SimpleNamespace(
+        running=True,
+        stop=hanging_stop,
+        start_polling=AsyncMock(),
+    )
+    adapter._app = SimpleNamespace(updater=updater)
+    adapter._drain_polling_connections = AsyncMock()
+    adapter._notify_fatal_error = AsyncMock(
+        side_effect=RuntimeError("runner callback failed")
+    )
+
+    import plugins.platforms.telegram.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(adapter_module, "_UPDATER_STOP_TIMEOUT", 0.05)
+
+    await adapter._handle_polling_conflict(Exception("conflict"))
+
+    assert adapter.has_fatal_error is True
+    assert adapter.fatal_error_code == "telegram_polling_stop_timeout"
+    assert adapter.fatal_error_retryable is True
+    adapter._notify_fatal_error.assert_awaited_once()
+    adapter._drain_polling_connections.assert_not_awaited()
+    updater.start_polling.assert_not_awaited()
+
