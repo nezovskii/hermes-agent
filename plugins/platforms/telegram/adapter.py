@@ -2215,11 +2215,11 @@ class TelegramAdapter(BasePlatformAdapter):
         messages.
 
         This loop probes ``get_me()`` every ``HEARTBEAT_INTERVAL`` seconds on the
-        *general* request path (not the getUpdates pool), so a healthy long-poll
-        waiting for the 30-second Telegram window is never interrupted.  On any
-        connect-level failure the loop hands off to
-        ``_handle_polling_network_error`` — the same path triggered by PTB's own
-        ``error_callback`` — which drains the dead pool and restarts polling.
+        *general* request path (not the getUpdates pool). A failure marks the
+        outbound send path degraded but deliberately leaves polling untouched:
+        the two PTB request pools have independent lifecycles. Actual getUpdates
+        failures arrive through PTB's polling error callback, while silent
+        consumer wedges are detected via ``pending_update_count`` below.
 
         Unlike ``_verify_polling_after_reconnect`` (a one-shot probe scheduled
         only after an explicit reconnect), this loop runs for the full lifetime
@@ -2244,6 +2244,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
                 await asyncio.wait_for(bot.get_me(), PROBE_TIMEOUT)
                 self._polling_heartbeat_failure_count = 0
+                self._send_path_degraded = False
                 # get_me() succeeded — the general/send request path is healthy.
                 # That does NOT prove the getUpdates consumer is alive: PTB can
                 # report updater.running=True while the long-poll task is wedged,
@@ -2258,28 +2259,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
             except (asyncio.TimeoutError, OSError) as probe_err:
                 self._polling_heartbeat_failure_count += 1
-                failure_count = self._polling_heartbeat_failure_count
+                self._send_path_degraded = True
                 safe_probe_error = _redact_telegram_error_text(probe_err)
-                if failure_count < 2:
-                    logger.warning(
-                        "[%s] Polling heartbeat probe failed (%s; failure %d/2); "
-                        "waiting for a second consecutive failure before reconnect",
-                        self.name, safe_probe_error, failure_count,
-                    )
-                    continue
                 logger.warning(
-                    "[%s] Polling heartbeat probe failed (%s; failure %d/2); triggering reconnect",
-                    self.name, safe_probe_error, failure_count,
+                    "[%s] Telegram general-path heartbeat failed (%s; consecutive=%d); "
+                    "leaving getUpdates polling untouched",
+                    self.name,
+                    safe_probe_error,
+                    self._polling_heartbeat_failure_count,
                 )
-                if self._polling_error_task and not self._polling_error_task.done():
-                    continue   # reconnect already in progress
-                self._polling_heartbeat_failure_count = 0
-                loop = asyncio.get_running_loop()
-                self._polling_error_task = loop.create_task(
-                    self._handle_polling_network_error(probe_err)
-                )
-                self._background_tasks.add(self._polling_error_task)
-                self._polling_error_task.add_done_callback(self._background_tasks.discard)
+                # get_me() uses Bot._request[1] (the general/send pool). Its
+                # failure says nothing about Bot._request[0], which owns the
+                # getUpdates long poll. Restarting polling here turns ordinary
+                # TLS loss into a destructive stop/start loop. Real poller
+                # failures are handled by PTB's getUpdates error callback;
+                # silent wedges are detected by _probe_pending_updates().
+                continue
             except Exception:
                 # Non-connectivity errors (e.g. TelegramError 401) are not
                 # CLOSE-WAIT symptoms — let PTB's own handlers surface them.
@@ -2390,20 +2385,13 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _verify_polling_after_reconnect(self) -> None:
         """Heartbeat probe scheduled after a successful reconnect.
 
-        PTB's Updater can survive a botched stop()+start_polling() cycle
-        with `running=True` but a wedged consumer task. No error callback
-        fires, so the reconnect ladder doesn't advance on its own. This
-        probe detects the wedge by:
+        This probe verifies two independent signals after a reconnect:
 
-        1. Sleeping HEARTBEAT_PROBE_DELAY so a healthy long-poll has time
-           to complete at least one cycle.
-        2. Verifying `Updater.running` is still True.
-        3. Probing the bot endpoint with a tight asyncio timeout. A
-           wedged httpx pool fails this probe; a healthy one returns
-           well under the timeout.
-
-        On any failure, re-enter the reconnect ladder so the existing
-        MAX_NETWORK_RETRIES path can ultimately escalate to fatal-error.
+        1. After ``HEARTBEAT_PROBE_DELAY``, ``Updater.running`` must still be
+           true. If it is false, re-enter polling recovery.
+        2. ``get_me()`` checks the separate general/send request pool. Failure
+           keeps sends degraded but cannot prove the getUpdates consumer is
+           wedged, so it must not trigger another polling stop/start cycle.
         """
         HEARTBEAT_PROBE_DELAY = 60
         PROBE_TIMEOUT = 10
@@ -2426,11 +2414,14 @@ class TelegramAdapter(BasePlatformAdapter):
             await asyncio.wait_for(self._app.bot.get_me(), PROBE_TIMEOUT)
             self._send_path_degraded = False
         except Exception as probe_err:
+            self._send_path_degraded = True
             logger.warning(
-                "[%s] Polling heartbeat probe failed %ds after reconnect: %s",
-                self.name, HEARTBEAT_PROBE_DELAY, probe_err,
+                "[%s] Telegram general/send path still degraded %ds after reconnect: %s; "
+                "leaving getUpdates polling untouched",
+                self.name,
+                HEARTBEAT_PROBE_DELAY,
+                _redact_telegram_error_text(probe_err),
             )
-            await self._handle_polling_network_error(probe_err)
 
     def _disarm_ptb_retry_loop(self) -> None:
         """Synchronously stop PTB's internal polling retry loop.

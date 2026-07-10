@@ -390,11 +390,8 @@ async def test_heartbeat_probe_reenters_ladder_when_updater_not_running():
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_probe_reenters_ladder_when_get_me_times_out():
-    """
-    If bot.get_me() hangs longer than PROBE_TIMEOUT, treat as wedged.
-    Simulates the connection-pool wedge that motivated this fix.
-    """
+async def test_heartbeat_probe_marks_send_degraded_when_get_me_times_out():
+    """A general Bot API timeout must not restart the independent poller."""
     adapter = _make_adapter()
 
     mock_updater = MagicMock()
@@ -419,15 +416,13 @@ async def test_heartbeat_probe_reenters_ladder_when_get_me_times_out():
         with patch("plugins.platforms.telegram.adapter.asyncio.wait_for", new=fast_wait_for):
             await adapter._verify_polling_after_reconnect()
 
-    adapter._handle_polling_network_error.assert_awaited_once()
+    adapter._handle_polling_network_error.assert_not_awaited()
+    assert adapter._send_path_degraded is True
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_probe_reenters_ladder_on_get_me_network_error():
-    """
-    Any exception raised by bot.get_me() (NetworkError, ConnectionError, etc.)
-    should re-enter the reconnect ladder with the original exception.
-    """
+async def test_heartbeat_probe_marks_send_degraded_on_get_me_network_error():
+    """A general Bot API connection error must not restart getUpdates polling."""
     adapter = _make_adapter()
 
     mock_updater = MagicMock()
@@ -443,10 +438,8 @@ async def test_heartbeat_probe_reenters_ladder_on_get_me_network_error():
     with patch("asyncio.sleep", new_callable=AsyncMock):
         await adapter._verify_polling_after_reconnect()
 
-    adapter._handle_polling_network_error.assert_awaited_once()
-    assert isinstance(
-        adapter._handle_polling_network_error.await_args.args[0], ConnectionError
-    )
+    adapter._handle_polling_network_error.assert_not_awaited()
+    assert adapter._send_path_degraded is True
 
 
 @pytest.mark.asyncio
@@ -580,8 +573,8 @@ async def test_heartbeat_loop_debounces_first_get_me_timeout():
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_loop_triggers_reconnect_after_consecutive_timeouts():
-    """Two consecutive get_me() timeouts schedule polling recovery."""
+async def test_heartbeat_loop_never_restarts_polling_on_general_timeouts():
+    """Repeated get_me() timeouts degrade sends but never restart getUpdates."""
     adapter = _make_adapter()
     adapter._handle_polling_network_error = AsyncMock()
 
@@ -605,18 +598,15 @@ async def test_heartbeat_loop_triggers_reconnect_after_consecutive_timeouts():
         with patch("plugins.platforms.telegram.adapter.asyncio.wait_for", side_effect=fast_wait_for):
             await adapter._polling_heartbeat_loop()
 
-    # A reconnect task must have been created only after the second failure.
-    assert adapter._polling_error_task is not None
-    adapter._polling_error_task.cancel()
-    try:
-        await adapter._polling_error_task
-    except (asyncio.CancelledError, Exception):
-        pass
+    assert adapter._polling_error_task is None
+    adapter._handle_polling_network_error.assert_not_awaited()
+    assert adapter._polling_heartbeat_failure_count == 2
+    assert adapter._send_path_degraded is True
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_loop_triggers_reconnect_on_os_error():
-    """Repeated OSError failures from get_me() must trigger a reconnect."""
+async def test_heartbeat_loop_never_restarts_polling_on_general_os_error():
+    """Repeated general-path OSError failures must not touch getUpdates."""
     adapter = _make_adapter()
     adapter._handle_polling_network_error = AsyncMock()
 
@@ -640,12 +630,10 @@ async def test_heartbeat_loop_triggers_reconnect_on_os_error():
         with patch("plugins.platforms.telegram.adapter.asyncio.wait_for", side_effect=os_error_wait_for):
             await adapter._polling_heartbeat_loop()
 
-    assert adapter._polling_error_task is not None
-    adapter._polling_error_task.cancel()
-    try:
-        await adapter._polling_error_task
-    except (asyncio.CancelledError, Exception):
-        pass
+    assert adapter._polling_error_task is None
+    adapter._handle_polling_network_error.assert_not_awaited()
+    assert adapter._polling_heartbeat_failure_count == 2
+    assert adapter._send_path_degraded is True
 
 
 @pytest.mark.asyncio
