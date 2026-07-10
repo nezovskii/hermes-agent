@@ -63,12 +63,43 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         proxy_url = _resolve_proxy_url(target_hosts=[_TELEGRAM_API_HOST, *self._fallback_ips])
         if proxy_url and "proxy" not in transport_kwargs:
             transport_kwargs["proxy"] = proxy_url
-        self._primary = httpx.AsyncHTTPTransport(**transport_kwargs)
-        self._fallbacks = {
-            ip: httpx.AsyncHTTPTransport(**transport_kwargs) for ip in self._fallback_ips
-        }
+        self._transport_kwargs = dict(transport_kwargs)
+        self._primary, self._fallbacks = self._build_transports()
         self._sticky_ip: Optional[str] = None
         self._sticky_lock = asyncio.Lock()
+        self._reset_lock = asyncio.Lock()
+
+    def _build_transports(self):
+        primary = httpx.AsyncHTTPTransport(**self._transport_kwargs)
+        fallbacks = {
+            ip: httpx.AsyncHTTPTransport(**self._transport_kwargs)
+            for ip in self._fallback_ips
+        }
+        return primary, fallbacks
+
+    async def reset(self) -> None:
+        """Atomically rotate inner pools, then close the abandoned pools.
+
+        PTB's ``HTTPXRequest.initialize()`` rebuilds its ``AsyncClient`` with
+        the same custom transport object. After a wedged ``Updater.stop()``,
+        using ``shutdown() -> initialize()`` can therefore leave the old
+        long-poll task owning a pool while the rebuilt client starts using the
+        same transport again. Repeated reconnects accumulate live Telegram
+        sockets. Rotating the pools inside this stable transport object gives
+        new requests fresh pools while in-flight requests retain only the old
+        pools that are immediately closed below.
+        """
+        async with self._reset_lock:
+            old_primary = self._primary
+            old_fallbacks = self._fallbacks
+            self._primary, self._fallbacks = self._build_transports()
+            self._sticky_ip = None
+
+        await asyncio.gather(
+            old_primary.aclose(),
+            *(transport.aclose() for transport in old_fallbacks.values()),
+            return_exceptions=True,
+        )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.url.host != _TELEGRAM_API_HOST or not self._fallback_ips:

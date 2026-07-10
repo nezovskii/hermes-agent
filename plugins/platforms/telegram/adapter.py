@@ -1862,6 +1862,30 @@ class TelegramAdapter(BasePlatformAdapter):
             polling_req = self._app.bot._request[0]  # noqa: SLF001
         except Exception:
             return
+
+        # The fallback-IP branch owns several inner AsyncHTTPTransport pools
+        # behind one stable custom transport object. PTB 22.6 rebuilds its
+        # AsyncClient with that same object after shutdown()/initialize(). If
+        # updater.stop() timed out, the abandoned long-poll task may still own
+        # the old pools, and repeated rebuilds accumulate live sockets. Rotate
+        # the inner pools in place instead; new requests get fresh pools and the
+        # old ones are closed without creating another PTB client.
+        try:
+            client = polling_req._client  # noqa: SLF001
+            transport = client._transport  # noqa: SLF001
+            if isinstance(transport, TelegramFallbackTransport):
+                await transport.reset()
+                logger.debug(
+                    "[%s] Polling fallback transport pools rotated before reconnect",
+                    self.name,
+                )
+                return
+        except Exception:
+            logger.debug(
+                "[%s] Polling fallback transport rotation failed; using PTB request reset",
+                self.name,
+                exc_info=True,
+            )
         try:
             await polling_req.shutdown()
         except Exception:
