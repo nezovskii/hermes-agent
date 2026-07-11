@@ -115,6 +115,33 @@ async def _run_abandon_cleanup(on_abandon) -> None:
         logger.debug("Abandoned Telegram init cleanup failed", exc_info=True)
 
 
+async def _force_close_app_transports(app) -> None:
+    """Directly close a PTB app's httpx request transports.
+
+    ``HTTPXRequest`` builds its ``httpx.AsyncClient`` eagerly in its constructor
+    and its ``shutdown()`` gates only on ``client.is_closed`` — unlike
+    ``Application.shutdown()`` / ``Bot.shutdown()``, which are gated on the app's
+    ``_initialized`` / ``_requests_initialized`` flags and therefore no-op (and
+    leak the connection pool) when the app was never fully initialized. Closing
+    the request transports directly releases the pool regardless of PTB init
+    state. Best-effort; all failures swallowed.
+    """
+    bot = getattr(app, "bot", None) if app is not None else None
+    requests = getattr(bot, "_request", None) if bot is not None else None
+    if not requests:
+        return
+    for request in requests:
+        shutdown = getattr(request, "shutdown", None)
+        if shutdown is None:
+            continue
+        try:
+            result = shutdown()
+            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                await result
+        except Exception:
+            logger.debug("Telegram request transport shutdown failed", exc_info=True)
+
+
 async def _shutdown_abandoned_app(app) -> None:
     """Release a half-built PTB app's httpx transports after init was abandoned.
 
@@ -137,20 +164,7 @@ async def _shutdown_abandoned_app(app) -> None:
     # Directly close the underlying request transports (bypasses PTB's
     # init-gated shutdown so the eagerly-built httpx pool is released even when
     # the abandoned initialize() never flipped _initialized).
-    bot = getattr(app, "bot", None)
-    requests = getattr(bot, "_request", None) if bot is not None else None
-    if not requests:
-        return
-    for request in requests:
-        shutdown = getattr(request, "shutdown", None)
-        if shutdown is None:
-            continue
-        try:
-            result = shutdown()
-            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
-                await result
-        except Exception:
-            logger.debug("Abandoned Telegram request shutdown failed", exc_info=True)
+    await _force_close_app_transports(app)
 
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
@@ -3593,6 +3607,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] Error during Telegram disconnect: %s",
                     self.name, _redact_telegram_error_text(e),
                 )
+            finally:
+                # ``app.shutdown()`` above is gated on PTB's init flags and
+                # no-ops (leaking the httpx pool) when the app never finished
+                # initialize() — e.g. an adapter torn down mid-reconnect, or one
+                # whose updater.stop() timed out above. Force-close the request
+                # transports directly so the connection pool is always released;
+                # otherwise orphaned pools accumulate ESTABLISHED sockets across
+                # reconnect churn until the process hits EMFILE (#too-many-fds).
+                await _force_close_app_transports(self._app)
         self._release_platform_lock()
 
 

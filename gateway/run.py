@@ -20122,6 +20122,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    # Raise the open-file-descriptor soft limit before anything opens fds.
+    # macOS launchd/GUI processes commonly inherit a soft limit of 256, which
+    # leaves no diagnostic headroom when a reconnect path leaks HTTP pools.
+    # Best-effort only: the leak must still be fixed at its source.
+    from gateway.fd_limits import raise_fd_limit
+    raise_fd_limit()
+
     # Reap stray transient KeepAlive launchd jobs before anything else. These are
     # run-once maintenance scripts mis-submitted via `launchctl submit` (which
     # defaults to KeepAlive=true) that end in `launchctl kickstart -k` and so
