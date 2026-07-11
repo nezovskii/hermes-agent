@@ -26913,6 +26913,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    # Raise the open-file-descriptor soft limit before anything opens fds.
+    # Best-effort only: the leak must still be fixed at its source.
+    from gateway.fd_limits import raise_fd_limit
+    raise_fd_limit()
+
+    # Reap accidental transient KeepAlive launchd jobs before startup.
+    try:
+        from gateway.launchd_janitor import reap_stray_transient_launchd_jobs
+        reap_stray_transient_launchd_jobs()
+    except Exception:
+        pass
+
     # Snapshot the checkout revision now, while sys.modules still matches disk,
     # so a later `git pull` under this long-lived process can be detected (and
     # risky work like model switching refused) instead of crashing on a stale
