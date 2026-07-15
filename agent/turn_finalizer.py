@@ -262,8 +262,9 @@ def finalize_turn(
     # fail with "Could not find old_string", and the model summarises
     # the turn claiming every file was edited.  The user then has to
     # manually run ``git status`` to catch the lie.  With this footer
-    # the truth is surfaced on every turn, so over-claiming is
-    # structurally impossible past the model.
+    # the failed tracked calls are surfaced on every turn.  The footer
+    # deliberately does not infer final filesystem state because terminal
+    # commands or external processes may also have changed the same paths.
     #
     # Gate: only applied when a real text response exists for this
     # turn and the user didn't interrupt.  Empty/interrupted turns

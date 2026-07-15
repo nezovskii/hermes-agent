@@ -1167,12 +1167,12 @@ display:
 
 ### 文件变更验证器
 
-当 `display.file_mutation_verifier` 为 `true`（默认）时，每当本轮中 `write_file` 或 `patch` 调用失败且从未被对同一路径的成功写入取代时，Hermes 会在 assistant 的最终响应中附加一行建议。这捕获了"批量并行补丁，一半静默失败，模型总结成功"这类过度声明，而无需您在每次编辑后手动运行 `git status`。
+当 `display.file_mutation_verifier` 为 `true`（默认）时，每当本轮中 `write_file` 或 `patch` 调用失败且从未被对同一路径的成功跟踪写入取代时，Hermes 会在 assistant 的最终响应中附加建议。该建议仅报告失败的工具调用，不推断文件系统的最终状态，因为终端命令或外部进程仍可能修改同一文件。这样既能捕获“批量并行补丁，一半静默失败，模型总结成功”这类过度声明，也不会声称验证器无法证明的事实。
 
 示例页脚：
 
 ```
-⚠️ File-mutation verifier: 3 file(s) were NOT modified this turn despite any wording above that may suggest otherwise. Run `git status` or `read_file` to confirm.
+⚠️ File-mutation verifier: tracked `write_file`/`patch` calls failed for 3 path(s) and were not followed by a successful tracked write to those paths. This does not prove the files are unchanged; another tool or process may still have modified them. Run `git status` or `read_file` to verify.
   • concepts/automatic-organization.md — [patch] Could not find match for old_string
   • concepts/lora.md — [patch] Could not find match for old_string
   • concepts/rag-pipeline.md — [patch] Could not find match for old_string

@@ -1435,12 +1435,12 @@ display:
 
 ### File-mutation verifier
 
-When `display.file_mutation_verifier` is `true` (default), Hermes appends a one-line advisory to the assistant's final response whenever a `write_file` or `patch` call failed during the turn and was never superseded by a successful write to the same path. This catches the "batch of parallel patches, half silently fail, model summarises success" class of over-claim without requiring you to manually run `git status` after every edit.
+When `display.file_mutation_verifier` is `true` (default), Hermes appends an advisory to the assistant's final response whenever a `write_file` or `patch` call failed during the turn and was never superseded by a successful tracked write to the same path. The advisory reports the failed tool calls, not the final filesystem state: terminal commands and external processes may still have modified the file. This catches the "batch of parallel patches, half silently fail, model summarises success" class of over-claim without making claims the verifier cannot prove.
 
 Example footer:
 
 ```
-⚠️ File-mutation verifier: 3 file(s) were NOT modified this turn despite any wording above that may suggest otherwise. Run `git status` or `read_file` to confirm.
+⚠️ File-mutation verifier: tracked `write_file`/`patch` calls failed for 3 path(s) and were not followed by a successful tracked write to those paths. This does not prove the files are unchanged; another tool or process may still have modified them. Run `git status` or `read_file` to verify.
   • concepts/automatic-organization.md — [patch] Could not find match for old_string
   • concepts/lora.md — [patch] Could not find match for old_string
   • concepts/rag-pipeline.md — [patch] Could not find match for old_string
