@@ -227,6 +227,22 @@ A file lock at `~/.hermes/cron/.tick.lock` prevents overlapping scheduler ticks 
 
 ## Delivery options
 
+### Optional Telegram feedback
+
+Set `feedback=true` on a cron job to attach a non-blocking rating keyboard to
+each Telegram delivery. The first tap records **Interesting** or **Not
+interesting**; a second keyboard allows multiple reasons before **Done**.
+Unlike `clarify`, cron feedback never pauses the job or waits for a reply.
+
+Finalized events are stored under
+`~/.hermes/cron/feedback/events.jsonl` (profile-local). Feedback attachment is
+best-effort: a Telegram edit failure does not turn a successful cron delivery
+into a failed run.
+
+```python
+cronjob(action="update", job_id="morning-brief", feedback=True)
+```
+
 When scheduling jobs, you specify where the output goes:
 
 | Option | Description | Example |

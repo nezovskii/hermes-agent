@@ -1345,6 +1345,54 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+def _maybe_attach_cron_feedback(
+    job: dict,
+    adapter: Any,
+    chat_id: Any,
+    thread_id: Any,
+    platform_name: str,
+    send_result: Any,
+    loop: Any,
+) -> bool:
+    """Attach optional feedback actions without affecting delivery success."""
+    if not job.get("feedback") or platform_name.lower() != "telegram":
+        return False
+    attach = getattr(type(adapter), "attach_cron_feedback", None)
+    if not callable(attach) or send_result is None:
+        return False
+    raw = getattr(send_result, "raw_response", None) or {}
+    message_ids = raw.get("message_ids") if isinstance(raw, dict) else None
+    message_id = message_ids[-1] if message_ids else getattr(send_result, "message_id", None)
+    if not message_id:
+        return False
+    try:
+        from agent.async_utils import safe_schedule_threadsafe
+        from cron.feedback import create_request
+
+        request = create_request(
+            job_id=job.get("id", ""),
+            job_name=job.get("name", job.get("id", "cron")),
+            platform=platform_name,
+            chat_id=str(chat_id),
+            thread_id=str(thread_id) if thread_id is not None else None,
+        )
+        future = safe_schedule_threadsafe(
+            attach(adapter, str(chat_id), str(message_id), request["id"]),
+            loop,
+        )
+        if future is None:
+            return False
+        result = future.result(timeout=15)
+        return _confirm_adapter_delivery(result)
+    except Exception:
+        logger.warning(
+            "Job '%s': failed to attach cron feedback actions",
+            job.get("id", "?"),
+            exc_info=True,
+        )
+        return False
+
+
 def _is_channel_dm_topic(
     runtime_adapter: Any,
     chat_id: Any,
@@ -1687,6 +1735,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
+                send_result = None
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
@@ -1849,6 +1898,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     delivery_errors.append(msg)
 
                 if adapter_ok:
+                    _maybe_attach_cron_feedback(
+                        job,
+                        runtime_adapter,
+                        chat_id,
+                        thread_id,
+                        platform_name,
+                        send_result,
+                        loop,
+                    )
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
                     # Seed the thread session only now that delivery into it

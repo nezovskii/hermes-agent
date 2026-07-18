@@ -1278,6 +1278,15 @@ Tap a button to answer, or tap **Other** to type a free-form response (the next 
 
 Configure the response timeout via `agent.clarify_timeout` in `~/.hermes/config.yaml` (default `600` seconds). If you don't respond within the timeout, the agent unblocks with a sentinel message and adapts rather than hanging.
 
+## Cron feedback buttons
+
+Cron jobs with `feedback=true` attach a non-blocking inline keyboard to the
+delivered message. Tapping **Interesting** or **Not interesting** opens a
+multi-select reason keyboard; **Done** stores the finalized event locally.
+This reuses Telegram inline keyboards, but not the blocking `clarify` lifecycle,
+so the scheduled run has already completed and cannot time out waiting for a
+human.
+
 ## Push notification volume
 
 Telegram fires a push notification on every message the bot sends. For long agent turns that emit tool-progress bubbles, streaming updates, and status callbacks, this gets noisy fast. The Telegram adapter has two notification modes:

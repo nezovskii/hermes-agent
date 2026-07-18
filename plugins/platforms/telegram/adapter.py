@@ -4759,6 +4759,63 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    @staticmethod
+    def _cron_feedback_markup(feedback_id: str, record: Optional[Dict[str, Any]] = None):
+        """Build the non-blocking cron feedback keyboard."""
+        if not record or not record.get("sentiment"):
+            return InlineKeyboardMarkup([[
+                InlineKeyboardButton("❤ Интересно", callback_data=f"cf:{feedback_id}:p"),
+                InlineKeyboardButton("🚫 Неинтересно", callback_data=f"cf:{feedback_id}:n"),
+            ]])
+
+        positive = {
+            "content": "Содержание",
+            "delivery": "Подача",
+            "structure": "Структура",
+            "format": "Формат",
+            "practical": "Практическая ценность",
+        }
+        negative = {
+            "not_applicable": "Не применимо",
+            "topic": "Неинтересная тема",
+            "writing": "Плохо написано",
+            "format": "Плохо сверстано",
+            "repetition": "Повтор / шум",
+        }
+        options = positive if record.get("sentiment") == "positive" else negative
+        selected = set(record.get("selections") or [])
+        rows = []
+        for code, label in options.items():
+            prefix = "✅ " if code in selected else ""
+            rows.append([
+                InlineKeyboardButton(
+                    prefix + label,
+                    callback_data=f"cf:{feedback_id}:t:{code}",
+                )
+            ])
+        rows.append([InlineKeyboardButton("Готово", callback_data=f"cf:{feedback_id}:d")])
+        return InlineKeyboardMarkup(rows)
+
+    async def attach_cron_feedback(
+        self,
+        chat_id: str,
+        message_id: str,
+        feedback_id: str,
+    ) -> SendResult:
+        """Attach feedback actions to an already delivered cron message."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            await self._bot.edit_message_reply_markup(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                message_id=int(message_id),
+                reply_markup=self._cron_feedback_markup(feedback_id),
+            )
+            return SendResult(success=True, message_id=str(message_id))
+        except Exception as exc:
+            logger.warning("[%s] attach_cron_feedback failed: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc))
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -5402,6 +5459,67 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Non-blocking cron feedback callbacks ---
+        if data.startswith("cf:"):
+            parts = data.split(":")
+            if len(parts) < 3:
+                await query.answer(text="Invalid feedback action.")
+                return
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to rate this briefing.")
+                return
+            feedback_id = parts[1]
+            token = parts[2]
+            action = {"p": "positive", "n": "negative", "d": "done"}.get(token)
+            if token == "t" and len(parts) == 4:
+                action = f"toggle:{parts[3]}"
+            if not action:
+                await query.answer(text="Invalid feedback action.")
+                return
+            try:
+                from cron.feedback import apply_action, load_request
+
+                pending = load_request(feedback_id)
+                if pending is None:
+                    raise KeyError(feedback_id)
+                if str(pending.get("chat_id")) != str(query_chat_id):
+                    await query.answer(text="This feedback action belongs to another chat.")
+                    return
+                pending_thread = pending.get("thread_id")
+                if pending_thread is not None and str(pending_thread) != str(query_thread_id):
+                    await query.answer(text="This feedback action belongs to another topic.")
+                    return
+                record = apply_action(feedback_id, action, user_id=caller_id)
+            except KeyError:
+                await query.answer(text="This feedback prompt has expired.")
+                return
+            except ValueError:
+                await query.answer(text="Invalid feedback action.")
+                return
+
+            if record.get("finalized_at"):
+                await query.answer(text="Сохранено")
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+            else:
+                await query.answer(text="Можно выбрать несколько вариантов")
+                try:
+                    await query.edit_message_reply_markup(
+                        reply_markup=self._cron_feedback_markup(feedback_id, record)
+                    )
+                except Exception:
+                    pass
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
