@@ -1797,6 +1797,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    feedback: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1893,6 +1894,8 @@ def create_job(
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
+    normalized_feedback = feedback if isinstance(feedback, bool) else None
+
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface these as clear ValueErrors at create time so bad configs never
     # reach the scheduler (shared with update_job, see
@@ -1995,6 +1998,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_feedback is not None:
+        job["feedback"] = normalized_feedback
 
     with _jobs_lock():
         jobs = load_jobs()
