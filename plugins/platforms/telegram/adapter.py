@@ -5803,6 +5803,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     resolved = False
 
                 if resolved:
+                    # Clarify pauses typing while the user chooses. Resume it
+                    # once the agent thread is unblocked so long-running work
+                    # remains visibly active, matching inline approvals.
+                    if query_chat_id is not None:
+                        self.resume_typing_for_chat(str(query_chat_id))
                     await query.answer(text=f"✓ {resolved_text[:60]}")
                     try:
                         await query.edit_message_text(

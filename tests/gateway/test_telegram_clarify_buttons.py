@@ -243,6 +243,36 @@ class TestTelegramClarifyCallback:
         query.edit_message_text.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_numeric_choice_resumes_typing_after_clarify(self):
+        """A successful clarify click must resume typing for the active turn."""
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        cm.register("cidTyping", "sk-cb", "Pick", ["red", "green"])
+        adapter._clarify_state["cidTyping"] = "sk-cb"
+        adapter.pause_typing_for_chat("12345")
+        assert "12345" in adapter._typing_paused
+
+        query = AsyncMock()
+        query.data = "cl:cidTyping:1"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.text = "Pick"
+        query.from_user = MagicMock()
+        query.from_user.id = "777"
+        query.from_user.first_name = "Tester"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        assert "12345" not in adapter._typing_paused
+
+    @pytest.mark.asyncio
     async def test_other_button_flips_to_text_mode(self):
         from tools import clarify_gateway as cm
 
