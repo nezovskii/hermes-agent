@@ -471,9 +471,13 @@ class TestCodexOAuthContextLength:
         assert stale_key not in remaining, "Stale entry was not invalidated from the cache file"
         assert remaining.get(other_key) == 128_000, "Unrelated cache entries must not be touched"
 
-    def test_fresh_codex_cache_under_400k_is_respected(self, tmp_path, monkeypatch):
-        """Codex entries at the correct 272k must NOT be invalidated —
-        only stale pre-fix values (>= 400k) get dropped."""
+    def test_codex_cache_under_400k_is_reconciled_with_live_endpoint(self, tmp_path, monkeypatch):
+        """A plausible Codex cache value must still yield to the live endpoint.
+
+        Codex windows can change without crossing the historical 400K stale
+        threshold, so treating every sub-400K value as permanently fresh can
+        make /new advertise the wrong limit indefinitely.
+        """
         from agent import model_metadata as mm
 
         cache_file = tmp_path / "context_length_cache.yaml"
@@ -482,19 +486,26 @@ class TestCodexOAuthContextLength:
         base_url = "https://chatgpt.com/backend-api/codex/"
         import yaml as _yaml
         cache_file.write_text(_yaml.dump({"context_lengths": {
-            f"gpt-5.5@{base_url}": 272_000,
+            f"gpt-5.6-sol@{base_url}": 372_000,
         }}))
 
-        # If the invalidation incorrectly fired, this would be called; assert it isn't.
-        with patch("agent.model_metadata.requests.get") as mock_get:
+        fake_response = MagicMock()
+        fake_response.status_code = 200
+        fake_response.json.return_value = {
+            "models": [{"slug": "gpt-5.6-sol", "context_window": 272_000}]
+        }
+
+        with patch("agent.model_metadata.requests.get", return_value=fake_response):
             ctx = mm.get_model_context_length(
-                model="gpt-5.5",
+                model="gpt-5.6-sol",
                 base_url=base_url,
                 api_key="fake-token",
                 provider="openai-codex",
             )
+
         assert ctx == 272_000
-        mock_get.assert_not_called()
+        remaining = _yaml.safe_load(cache_file.read_text()).get("context_lengths", {})
+        assert remaining[f"gpt-5.6-sol@{base_url}"] == 272_000
 
     def test_stale_invalidation_scoped_to_codex_provider(self, tmp_path, monkeypatch):
         """A cached 1M entry for a non-Codex provider (e.g. Anthropic opus on

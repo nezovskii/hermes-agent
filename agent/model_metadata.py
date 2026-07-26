@@ -1976,12 +1976,28 @@ def get_model_context_length(
     if base_url and not _skip_persistent_context_cache(base_url, provider):
         cached = get_cached_context_length(model, base_url)
         if cached is not None:
-            # Invalidate stale Codex OAuth cache entries: pre-PR #14935 builds
-            # resolved gpt-5.x to the direct-API value (e.g. 1.05M) via
-            # models.dev and persisted it. Codex OAuth caps at 272K for every
-            # slug, so any cached Codex entry at or above 400K is a leftover
-            # from the old resolution path. Drop it and fall through to the
-            # live /models probe in step 5 below.
+            # Codex's live /models endpoint is authoritative and may change a
+            # model's window over time. Reconcile every persistent Codex cache
+            # hit instead of trusting an old value merely because it is below
+            # the historical 400K stale-value threshold. This prevents values
+            # such as 372K from masking the current 272K provider limit.
+            if provider == "openai-codex":
+                codex_ctx = _resolve_codex_oauth_context_length(
+                    model, access_token=api_key or ""
+                )
+                if codex_ctx:
+                    if codex_ctx != cached:
+                        logger.info(
+                            "Reconciling Codex cache entry %s@%s: %s -> %s",
+                            model, base_url, f"{cached:,}", f"{codex_ctx:,}",
+                        )
+                        _invalidate_cached_context_length(model, base_url)
+                        save_context_length(model, base_url, codex_ctx)
+                    return codex_ctx
+
+            # Invalidate stale Codex OAuth cache entries when an unknown Codex
+            # slug could not be resolved above. Pre-PR #14935 builds resolved
+            # gpt-5.x to the direct-API value (e.g. 1.05M) via models.dev.
             if provider == "openai-codex" and cached >= 400_000:
                 logger.info(
                     "Dropping stale Codex cache entry %s@%s -> %s (pre-fix value); "
