@@ -4552,11 +4552,11 @@ def block_task(
     un-typed block) drives routing instead of every block landing in one
     undifferentiated ``blocked`` bucket:
 
-    * ``dependency`` — the task is only waiting on another task. It does NOT
-      sit in ``blocked`` (where a cron would keep "unblocking" it); it goes to
-      ``todo`` so the existing parent-gating / ``recompute_ready`` machinery
-      promotes it automatically once its parents finish. No human, no cron, no
-      retry storm. This is Dale's "Type 2 — dependency blocked".
+    * ``dependency`` — when the task has a real unfinished parent edge, it does
+      NOT sit in ``blocked``; it goes to ``todo`` so parent-gating promotes it
+      automatically once its parents finish. A dependency claim without an
+      unfinished parent is treated as ``needs_input`` instead, preventing an
+      immediate ``todo -> ready -> spawn -> block`` retry storm.
 
     * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
@@ -4594,10 +4594,28 @@ def block_task(
             else 0
         )
 
-        # Dependency blocks never enter the human ``blocked`` bucket — they
-        # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
-        # here (rather than ``blocked``) is what keeps a cron from ever seeing
-        # a dependency-wait as something to "unblock".
+        # A dependency block is auto-retryable only when the task has an
+        # actual unfinished parent edge. Workers sometimes use
+        # ``kind=dependency`` for external prerequisites (missing credentials,
+        # unmerged commits, unavailable services). Parking those tasks in
+        # ``todo`` makes recompute_ready immediately promote them because the
+        # empty parent set is vacuously complete, creating a spawn/block loop.
+        if kind == "dependency":
+            unfinished_parent = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if unfinished_parent is None:
+                kind = "needs_input"
+
+        # Dependency blocks with a real unfinished parent never enter the
+        # human ``blocked`` bucket — they wait in ``todo`` and let
+        # ``recompute_ready`` gate on parents. Routing here (rather than
+        # ``blocked``) is what keeps a cron from ever seeing a dependency-wait
+        # as something to "unblock".
         if kind == "dependency":
             cur = conn.execute(
                 """
