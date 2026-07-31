@@ -3977,6 +3977,41 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+def _script_failure_evidence(*, stdout: str, stderr: str, max_chars: int = 240) -> str:
+    """Return one concrete, preview-safe reason for a failed cron script."""
+    stdout_lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    stderr_lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+
+    evidence = next(
+        (
+            line
+            for line in stdout_lines
+            if line.startswith(("Факт:", "Fact:", "Сломано:", "Failed invariant:"))
+        ),
+        None,
+    )
+    if evidence is None and stderr_lines:
+        evidence = stderr_lines[0]
+    if evidence is None:
+        evidence = next(
+            (
+                line
+                for line in stdout_lines
+                if line.startswith(("Итог:", "Verdict:"))
+            ),
+            None,
+        )
+    if evidence is None and stdout_lines:
+        evidence = stdout_lines[0]
+    if evidence is None:
+        return "no stdout/stderr captured"
+
+    evidence = " ".join(evidence.split())
+    if len(evidence) > max_chars:
+        evidence = evidence[: max_chars - 3].rstrip() + "..."
+    return evidence
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -4156,7 +4191,10 @@ def _run_job_script(
             stderr = "[REDACTED - redaction failed]"
 
         if proc.returncode != 0:
-            parts = [f"Script exited with code {proc.returncode}"]
+            evidence = _script_failure_evidence(stdout=stdout, stderr=stderr)
+            parts = [
+                f"Script {path.name} exited with code {proc.returncode}: {evidence}"
+            ]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
