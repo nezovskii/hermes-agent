@@ -2068,6 +2068,46 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
+def _script_failure_evidence(*, stdout: str, stderr: str, max_chars: int = 240) -> str:
+    """Return one concrete, preview-safe reason for a failed cron script.
+
+    Structured watchdogs put their exact invariant in ``Факт:`` / ``Fact:``.
+    Prefer that over generic alert headers, then fall back to stderr, verdict,
+    or the first stdout line. Full streams remain attached below the summary.
+    """
+    stdout_lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    stderr_lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+
+    evidence = next(
+        (
+            line
+            for line in stdout_lines
+            if line.startswith(("Факт:", "Fact:", "Сломано:", "Failed invariant:"))
+        ),
+        None,
+    )
+    if evidence is None and stderr_lines:
+        evidence = stderr_lines[0]
+    if evidence is None:
+        evidence = next(
+            (
+                line
+                for line in stdout_lines
+                if line.startswith(("Итог:", "Verdict:"))
+            ),
+            None,
+        )
+    if evidence is None and stdout_lines:
+        evidence = stdout_lines[0]
+    if evidence is None:
+        return "no stdout/stderr captured"
+
+    evidence = " ".join(evidence.split())
+    if len(evidence) > max_chars:
+        evidence = evidence[: max_chars - 3].rstrip() + "..."
+    return evidence
+
+
 def _run_job_script(script_path: str) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2177,7 +2217,10 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             stderr = "[REDACTED - redaction failed]"
 
         if result.returncode != 0:
-            parts = [f"Script exited with code {result.returncode}"]
+            evidence = _script_failure_evidence(stdout=stdout, stderr=stderr)
+            parts = [
+                f"Script {path.name} exited with code {result.returncode}: {evidence}"
+            ]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
