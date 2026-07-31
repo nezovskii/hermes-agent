@@ -110,6 +110,56 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
 # ---------------------------------------------------------------------------
 
 
+def test_run_job_script_failure_promotes_structured_fact(hermes_env):
+    from cron.scheduler import _run_job_script
+
+    script_path = hermes_env / "scripts" / "trust_watchdog.py"
+    script_path.write_text(
+        "import sys\n"
+        "print('🔴 Trust watchdog - СРОЧНО')\n"
+        "print('Итог: generic trust failure')\n"
+        "print('Факт: Konstantin orphan ratio 61% > 50%')\n"
+        "sys.exit(2)\n"
+    )
+
+    ok, output = _run_job_script("trust_watchdog.py")
+
+    assert ok is False
+    assert output.splitlines()[0] == (
+        "Script trust_watchdog.py exited with code 2: "
+        "Факт: Konstantin orphan ratio 61% > 50%"
+    )
+    assert "stdout:\n🔴 Trust watchdog" in output
+
+
+def test_run_job_script_failure_uses_first_stderr_line_when_no_fact(hermes_env):
+    from cron.scheduler import _run_job_script
+
+    script_path = hermes_env / "scripts" / "broken.sh"
+    script_path.write_text("printf 'database lock timeout\\nsecond line\\n' >&2\nexit 7\n")
+
+    ok, output = _run_job_script("broken.sh")
+
+    assert ok is False
+    assert output.splitlines()[0] == (
+        "Script broken.sh exited with code 7: database lock timeout"
+    )
+
+
+def test_run_job_script_failure_names_empty_diagnostics(hermes_env):
+    from cron.scheduler import _run_job_script
+
+    script_path = hermes_env / "scripts" / "silent_failure.py"
+    script_path.write_text("raise SystemExit(9)\n")
+
+    ok, output = _run_job_script("silent_failure.py")
+
+    assert ok is False
+    assert output == (
+        "Script silent_failure.py exited with code 9: no stdout/stderr captured"
+    )
+
+
 def test_run_job_script_path_traversal_still_blocked(hermes_env):
     """Security regression: shell-script support must NOT loosen containment."""
     from cron.scheduler import _run_job_script
