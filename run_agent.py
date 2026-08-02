@@ -3410,17 +3410,29 @@ class AIAgent:
         state = getattr(self, "_turn_failed_file_mutations", None)
         if state is None:
             return
-        targets = _extract_file_mutation_targets(tool_name, args)
-        if not targets:
+        raw_targets = _extract_file_mutation_targets(tool_name, args)
+        if not raw_targets:
             return
+
+        def _canonical_path(path: str) -> str:
+            """Collapse aliases so retries through symlinks share one state key."""
+            try:
+                return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+            except Exception:
+                return path
+
         landed = file_mutation_result_landed(tool_name, result)
+        landed_paths = (
+            _extract_landed_file_mutation_paths(tool_name, args, result)
+            if landed else []
+        )
         if landed:
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
-                changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
+                changed.update(landed_paths)
         if is_error and not landed:
             preview = _extract_error_preview(result)
-            for path in targets:
+            for path in raw_targets:
                 # Keep the FIRST error we saw for a given path unless we
                 # later see success.  A repeated failure with a different
                 # message shouldn't silently overwrite the original.
@@ -3430,8 +3442,12 @@ class AIAgent:
                         "error_preview": preview,
                     }
         else:
-            for path in targets:
-                state.pop(path, None)
+            successful_paths = {
+                _canonical_path(path) for path in raw_targets
+            } | {_canonical_path(path) for path in landed_paths}
+            for failed_path in list(state):
+                if _canonical_path(failed_path) in successful_paths:
+                    state.pop(failed_path, None)
 
     def _file_mutation_verifier_enabled(self) -> bool:
         """Check whether the per-turn file-mutation verifier footer is on.
