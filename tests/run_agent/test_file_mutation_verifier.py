@@ -150,6 +150,36 @@ class TestRecordFileMutationResult:
         assert agent._turn_failed_file_mutations == {}
         assert agent._turn_file_mutation_paths == {"/tmp/a.md"}
 
+    def test_success_via_resolved_symlink_path_clears_prior_failure(self, tmp_path):
+        agent = _bare_agent()
+        physical_dir = tmp_path / "physical"
+        physical_dir.mkdir()
+        alias_dir = tmp_path / "alias"
+        alias_dir.symlink_to(physical_dir, target_is_directory=True)
+        alias_path = alias_dir / "a.md"
+        physical_path = physical_dir / "a.md"
+
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(alias_path), "old_string": "x", "new_string": "y"},
+            json.dumps({"success": False, "error": "transient read failure"}),
+            is_error=True,
+        )
+        assert getattr(agent, "_turn_failed_file_mutations")
+
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(physical_path), "old_string": "x", "new_string": "y"},
+            json.dumps({
+                "success": True,
+                "diff": "...",
+                "resolved_path": str(physical_path),
+                "files_modified": [str(physical_path)],
+            }),
+            is_error=False,
+        )
+
+        assert getattr(agent, "_turn_failed_file_mutations") == {}
 
     def test_landed_paths_prefer_resolved_tool_result(self):
         paths = _extract_landed_file_mutation_paths(
