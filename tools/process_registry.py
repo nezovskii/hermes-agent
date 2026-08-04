@@ -1956,13 +1956,7 @@ class ProcessRegistry:
             return any(not s.exited for s in self._running.values())
 
     def snapshot_running_ids(self, task_id: str) -> frozenset[str]:
-        """Capture running process IDs owned by ``task_id``.
-
-        Gateway turns use this as a boundary marker: if a turn times out, only
-        processes absent from its starting snapshot belong to the abandoned
-        turn. Older session processes must survive because background tasks
-        intentionally span successful turns.
-        """
+        """Capture running process IDs owned by ``task_id``."""
         with self._lock:
             return frozenset(
                 s.id
@@ -1977,12 +1971,7 @@ class ProcessRegistry:
         *,
         source: str,
     ) -> int:
-        """Kill processes created for ``task_id`` after a prior snapshot.
-
-        ``consume_output`` is forced on: abandoned-turn output must not
-        enqueue a synthetic follow-up that revives work the timeout
-        deliberately stopped.
-        """
+        """Kill processes created for ``task_id`` after a prior snapshot."""
         return self.kill_all(
             task_id,
             exclude_ids=frozenset(baseline_ids or ()),
@@ -1993,18 +1982,30 @@ class ProcessRegistry:
     def kill_all(
         self,
         task_id: Optional[str] = None,
+        session_key: Optional[str] = None,
         *,
         exclude_ids: frozenset = frozenset(),
         source: str = "kill_all",
         consume_output: bool = False,
     ) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+        """Kill owned running processes and return the count killed.
+
+        With both ownership selectors, matching either is intentional: local
+        terminal processes can share ``task_id='default'`` while retaining the
+        originating agent in ``session_key``. ``exclude_ids`` preserves
+        processes that predate a per-turn cleanup boundary.
+        """
         with self._lock:
             targets = [
-                s for s in self._running.values()
-                if (task_id is None or s.task_id == task_id)
+                s
+                for s in self._running.values()
+                if not s.exited
                 and s.id not in exclude_ids
-                and not s.exited
+                and (
+                    (task_id is None and session_key is None)
+                    or (task_id is not None and s.task_id == task_id)
+                    or (session_key is not None and s.session_key == session_key)
+                )
             ]
 
         killed = 0
