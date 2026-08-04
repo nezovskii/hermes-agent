@@ -784,10 +784,9 @@ def test_block_goal_mode_allows_dependency_kind(monkeypatch, tmp_path):
     """`dependency` and `needs_input` represent a genuine external blocker
     the worker cannot resolve itself — these remain ungated.
 
-    `dependency` routes to status='todo' (not 'blocked') per block_task's
-    own kind-routing — the goal loop still treats anything outside
-    running/ready/done/blocked as a stop, so this is still a legitimate,
-    judge-free exit; it's just not the literal 'blocked' status."""
+    A dependency without an unfinished parent is not a real graph dependency.
+    The kernel remaps that orphan state to sticky ``needs_input`` so it cannot
+    create an automatic ready -> dispatch -> dependency retry storm."""
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
 
@@ -798,7 +797,10 @@ def test_block_goal_mode_allows_dependency_kind(monkeypatch, tmp_path):
 
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, tid).status == "todo"
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
     finally:
         conn.close()
 
