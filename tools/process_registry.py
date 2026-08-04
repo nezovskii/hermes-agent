@@ -1699,12 +1699,29 @@ class ProcessRegistry:
         with self._lock:
             return any(not s.exited for s in self._running.values())
 
-    def kill_all(self, task_id: str = None) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+    def kill_all(
+        self,
+        task_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+    ) -> int:
+        """Kill owned running processes and return the count killed.
+
+        ``task_id`` preserves the historical sandbox-wide ownership filter.
+        ``session_key`` scopes cleanup to the originating agent session.  When
+        both are provided, a process matching either ownership dimension is
+        selected.  The OR is intentional: top-level local terminal processes
+        share ``task_id='default'`` while retaining their real owner in
+        ``session_key``.
+        """
         with self._lock:
             targets = [
                 s for s in self._running.values()
-                if (task_id is None or s.task_id == task_id) and not s.exited
+                if not s.exited
+                and (
+                    (task_id is None and session_key is None)
+                    or (task_id is not None and s.task_id == task_id)
+                    or (session_key is not None and s.session_key == session_key)
+                )
             ]
 
         killed = 0
