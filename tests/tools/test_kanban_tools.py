@@ -295,6 +295,28 @@ def test_block_goal_mode_rejects_disallowed_kind(monkeypatch, tmp_path):
         conn.close()
 
 
+def test_block_goal_mode_allows_orphan_dependency_as_needs_input(
+    monkeypatch, tmp_path
+):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    out = kt._handle_block(
+        {"reason": "waiting on external prerequisite", "kind": "dependency"}
+    )
+    assert json.loads(out).get("ok") is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+    finally:
+        conn.close()
+
+
 def test_heartbeat_extends_claim_expires(worker_env):
     """The kanban_heartbeat tool MUST extend claim_expires, not just
     update last_heartbeat_at — otherwise long-running workers loop the
