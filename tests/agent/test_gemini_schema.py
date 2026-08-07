@@ -70,6 +70,19 @@ class TestSanitizeGeminiSchema:
         # ...but the sibling string enum is preserved.
         assert props["status"]["enum"] == ["active", "archived"]
 
+    def test_adds_items_for_bare_array_schema(self):
+        schema = {
+            "type": "object",
+            "properties": {"pages_updated": {"type": "array"}},
+        }
+
+        cleaned = sanitize_gemini_schema(schema)
+
+        assert cleaned["properties"]["pages_updated"] == {
+            "type": "array",
+            "items": {"type": "object", "properties": {}},
+        }
+
 
 
     def test_non_dict_input_returns_empty(self):

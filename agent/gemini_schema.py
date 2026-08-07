@@ -128,6 +128,12 @@ def sanitize_gemini_schema(schema: Any) -> Dict[str, Any]:
         elif len(valid_required) != len(required_val):
             cleaned["required"] = valid_required
 
+    # Gemini rejects ``type: array`` without an explicit item schema. MCP and
+    # Pydantic tools may emit bare arrays for loosely typed lists; preserve
+    # that permissive intent with an unconstrained object item.
+    if type_val == "array" and not isinstance(cleaned.get("items"), dict):
+        cleaned["items"] = {"type": "object", "properties": {}}
+
     return cleaned
 
 
