@@ -255,4 +255,3 @@ def test_nia_context_search_uses_semantic_endpoint(monkeypatch, tmp_path):
     assert result == {"results": []}
     assert captured["method"] == "GET"
     assert captured["url"] == "https://apigcp.trynia.ai/v2/contexts/semantic-search?q=OpenJarvis&limit=3"
-
