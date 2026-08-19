@@ -19,11 +19,16 @@ the raw exception:
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
+from telegram.error import NetworkError
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import (
+    TelegramAdapter,
+    _redact_telegram_error_text,
+)
 
 _SECRET_TOKEN = "123456789:AAFakeSecretTelegramBotTokenABCDEFGHIJ"
 _SECRET_URL = f"https://api.telegram.org/bot{_SECRET_TOKEN}/getMe"
@@ -41,6 +46,116 @@ def _make_connected_adapter() -> TelegramAdapter:
     bot.send_chat_action = AsyncMock()
     adapter._bot = bot
     return adapter
+
+
+def test_empty_transport_error_keeps_a_non_empty_diagnostic():
+    safe_error = _redact_telegram_error_text(httpx.ReadError(""))
+
+    assert safe_error == "ReadError"
+    assert not safe_error.endswith(":")
+
+
+def test_wrapped_empty_transport_error_does_not_end_with_a_bare_colon():
+    safe_error = _redact_telegram_error_text(RuntimeError("httpx.ReadError: "))
+
+    assert safe_error == "httpx.ReadError: <no details>"
+
+
+@pytest.mark.asyncio
+async def test_polling_error_callback_redacts_token_without_raw_traceback(
+    monkeypatch, caplog
+):
+    adapter = _make_bare_adapter()
+    captured = {}
+
+    monkeypatch.setattr(
+        "gateway.status.acquire_scoped_lock",
+        lambda scope, identity, metadata=None: (True, None),
+    )
+    monkeypatch.setattr(
+        "gateway.status.release_scoped_lock",
+        lambda scope, identity: None,
+    )
+
+    async def fake_start_polling(**kwargs):
+        captured["error_callback"] = kwargs["error_callback"]
+        adapter._record_polling_progress(adapter._polling_generation)
+
+    updater = SimpleNamespace(
+        start_polling=AsyncMock(side_effect=fake_start_polling),
+        running=True,
+    )
+    bot = SimpleNamespace(set_my_commands=AsyncMock(), delete_webhook=AsyncMock())
+    app = SimpleNamespace(
+        bot=bot,
+        updater=updater,
+        add_handler=MagicMock(),
+        initialize=AsyncMock(),
+        start=AsyncMock(),
+    )
+    builder = MagicMock()
+    builder.token.return_value = builder
+    builder.request.return_value = builder
+    builder.get_updates_request.return_value = builder
+    builder.build.return_value = app
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.Application",
+        SimpleNamespace(builder=MagicMock(return_value=builder)),
+    )
+
+    assert await adapter.connect() is True
+
+    callback_error = RuntimeError(f"polling failed via {_SECRET_URL}")
+    with caplog.at_level("ERROR"):
+        captured["error_callback"](callback_error)
+
+    records = [
+        record
+        for record in caplog.records
+        if "Telegram polling error" in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert _SECRET_TOKEN not in records[0].getMessage()
+    assert "***" in records[0].getMessage()
+    assert "_redact_telegram_error_text(" not in records[0].getMessage()
+    assert records[0].exc_info is None
+
+    adapter._handle_polling_network_error = AsyncMock()
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        captured["error_callback"](
+            NetworkError(f"network polling failed via {_SECRET_URL}")
+        )
+        polling_task = adapter._polling_error_task
+        assert polling_task is not None
+        await polling_task
+
+    records = [
+        record
+        for record in caplog.records
+        if "Telegram network error, scheduling reconnect" in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert _SECRET_TOKEN not in records[0].getMessage()
+    assert "***" in records[0].getMessage()
+    assert "_redact_telegram_error_text(" not in records[0].getMessage()
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        captured["error_callback"](NetworkError("httpx.ReadError: "))
+        polling_task = adapter._polling_error_task
+        assert polling_task is not None
+        await polling_task
+
+    records = [
+        record
+        for record in caplog.records
+        if "Telegram network error, scheduling reconnect" in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert records[0].getMessage().endswith("httpx.ReadError: <no details>")
+
+    await adapter.disconnect()
 
 
 @pytest.mark.asyncio
