@@ -27,13 +27,21 @@ logger = logging.getLogger(__name__)
 
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
-    text = "" if error is None else str(error)
+    fallback = type(error).__name__ if error is not None else "UnknownError"
+    text = "" if error is None else str(error).strip()
     if not text:
-        return text
+        text = fallback
+    elif text.endswith(":"):
+        text = f"{text} <no details>"
     try:
         from agent.redact import redact_sensitive_text
 
-        return redact_sensitive_text(text, force=True)
+        safe_text = redact_sensitive_text(text, force=True).strip()
+        if not safe_text:
+            return fallback
+        if safe_text.endswith(":"):
+            return f"{safe_text} <no details>"
+        return safe_text
     except Exception:
         return "<telegram error redacted>"
 
@@ -4774,12 +4782,23 @@ class TelegramAdapter(BasePlatformAdapter):
                         self._background_tasks.add(self._polling_error_task)
                         self._polling_error_task.add_done_callback(self._background_tasks.discard)
                     elif self._looks_like_network_error(error):
-                        logger.warning("[%s] Telegram network _redact_telegram_error_text(error), scheduling reconnect: %s", self.name, error)
+                        logger.warning(
+                            "[%s] Telegram network error, scheduling reconnect: %s",
+                            self.name,
+                            _redact_telegram_error_text(error),
+                        )
                         self._polling_error_task = loop.create_task(self._handle_polling_network_error(error))
                         self._background_tasks.add(self._polling_error_task)
                         self._polling_error_task.add_done_callback(self._background_tasks.discard)
                     else:
-                        logger.error("[%s] Telegram polling _redact_telegram_error_text(error): %s", self.name, error, exc_info=True)
+                        # Do not attach ``exc_info`` here: PTB invokes this
+                        # callback outside an active exception handler, and a
+                        # traceback would bypass the sanitized message.
+                        logger.error(
+                            "[%s] Telegram polling error: %s",
+                            self.name,
+                            _redact_telegram_error_text(error),
+                        )
 
                 # Store reference for retry use in _handle_polling_conflict
                 self._polling_error_callback_ref = _polling_error_callback
