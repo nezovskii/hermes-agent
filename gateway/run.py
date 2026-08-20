@@ -2427,6 +2427,10 @@ from gateway.restart import (
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
 )
+from gateway.shutdown_notice_cleanup import (
+    cleanup_shutdown_notices,
+    record_shutdown_notice,
+)
 
 
 from gateway.whatsapp_identity import (
@@ -9493,6 +9497,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     continue
 
+                record_shutdown_notice(_hermes_home, platform, chat_id, result)
                 notified.add(dedup_key)
                 logger.info(
                     "Sent shutdown notification to active chat %s:%s",
@@ -9576,6 +9581,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     continue
 
+                record_shutdown_notice(
+                    _hermes_home, platform, str(home.chat_id), result
+                )
                 notified.add(dedup_key)
                 logger.info(
                     "Sent shutdown notification to home channel %s:%s",
@@ -11556,6 +11564,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._loop_heartbeat_task.add_done_callback(_bg.discard)
         except Exception:
             logger.debug("Failed to start gateway loop heartbeat", exc_info=True)
+
+        # The previous process could only send, not later retract, its Telegram
+        # shutdown banner. Remove it now that adapters are connected again.
+        await cleanup_shutdown_notices(_hermes_home, self.adapters)
 
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)

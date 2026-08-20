@@ -43,6 +43,7 @@ from gateway.run import (
     _should_clear_resume_pending_after_turn,
     build_resume_recovery_note,
 )
+from gateway.shutdown_notice_cleanup import cleanup_shutdown_notices
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from tests.gateway.restart_test_helpers import (
     make_restart_runner,
@@ -777,6 +778,96 @@ async def test_restart_home_channel_notification_not_deduped_across_threads():
     assert len(adapter.sent) == 2
     assert adapter.sent_calls[0][2] == {"thread_id": "topic-7"}
     assert adapter.sent_calls[1][2] is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_banner_is_persisted_for_cleanup_after_restart(
+    tmp_path, monkeypatch
+):
+    import json
+
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    payload = json.loads(
+        (tmp_path / "state" / "gateway-shutdown-notice-cleanup.json").read_text()
+    )
+    assert payload["version"] == 1
+    assert payload["notices"] == [
+        {
+            "platform": "telegram",
+            "chat_id": "home-42",
+            "message_id": "1",
+            "created_at": payload["notices"][0]["created_at"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_startup_deletes_persisted_telegram_shutdown_banner(
+    tmp_path, monkeypatch
+):
+    import json
+
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    state_path = tmp_path / "state" / "gateway-shutdown-notice-cleanup.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "notices": [
+                    {
+                        "platform": "telegram",
+                        "chat_id": "home-42",
+                        "message_id": "123",
+                        "created_at": time.time(),
+                    }
+                ],
+            }
+        )
+    )
+    runner, adapter = make_restart_runner()
+    adapter.delete_message = AsyncMock(return_value=True)
+
+    deleted = await cleanup_shutdown_notices(tmp_path, runner.adapters)
+
+    assert deleted == 1
+    adapter.delete_message.assert_awaited_once_with("home-42", "123")
+    assert not state_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_startup_retains_recent_shutdown_banner_when_delete_fails(
+    tmp_path, monkeypatch
+):
+    import json
+
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    state_path = tmp_path / "state" / "gateway-shutdown-notice-cleanup.json"
+    state_path.parent.mkdir(parents=True)
+    notice = {
+        "platform": "telegram",
+        "chat_id": "home-42",
+        "message_id": "123",
+        "created_at": time.time(),
+    }
+    state_path.write_text(json.dumps({"version": 1, "notices": [notice]}))
+    runner, adapter = make_restart_runner()
+    adapter.delete_message = AsyncMock(return_value=False)
+
+    deleted = await cleanup_shutdown_notices(tmp_path, runner.adapters)
+
+    assert deleted == 0
+    assert json.loads(state_path.read_text())["notices"] == [notice]
 
 
 # ---------------------------------------------------------------------------
