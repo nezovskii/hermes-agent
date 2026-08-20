@@ -1492,6 +1492,7 @@ class BaseEnvironment(ABC):
             exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
             effective_stdin = None
 
+        effective_cwd = self._resolve_effective_cwd(effective_cwd)
         wrapped = self._wrap_command(exec_command, effective_cwd)
 
         # Use login shell if snapshot failed (so user's profile still loads),
@@ -1588,6 +1589,17 @@ class BaseEnvironment(ABC):
     def stop(self):
         """Alias for cleanup (compat with older callers)."""
         self.cleanup()
+
+    def _resolve_effective_cwd(self, cwd: str) -> str:
+        """Return the cwd that should be embedded in the shell wrapper.
+
+        Backends may override this when their process-spawn cwd can recover
+        from a stale directory before bash starts. The wrapper must use the
+        same recovered directory; otherwise the process can start in a safe cwd
+        and then immediately exit 126 while trying to ``cd`` into the deleted
+        path embedded by ``_wrap_command``.
+        """
+        return cwd
 
     def __del__(self):
         try:

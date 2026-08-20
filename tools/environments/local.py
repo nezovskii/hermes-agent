@@ -2116,29 +2116,10 @@ class LocalEnvironment(BaseEnvironment):
         run_env = _make_run_env(self.env)
 
         # Recover when the cwd has been deleted out from under us — usually by
-        # a previous tool call that ran ``rm -rf`` on its own working dir
-        # (issue #17558).  Popen would otherwise raise FileNotFoundError on
-        # the cwd before bash starts, wedging every subsequent call until the
-        # gateway restarts.
-        #
-        # On Windows, ``_resolve_safe_cwd`` also normalises Git Bash-style
-        # POSIX paths (``/c/Users/...``) to native form so a perfectly valid
-        # ``pwd -P`` result from bash isn't mistakenly treated as "missing"
-        # and spammed as a warning on every command.
-        safe_cwd = _resolve_safe_cwd(self.cwd)
-        if safe_cwd != self.cwd:
-            # MSYS → Windows translation alone shouldn't surface as a warning
-            # (it's a benign normalization, not a recovery). Only warn when
-            # the directory really doesn't exist on disk.
-            normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
-            if safe_cwd != normalized:
-                logger.warning(
-                    "LocalEnvironment cwd %r is missing on disk; "
-                    "falling back to %r so terminal commands keep working.",
-                    self.cwd,
-                    safe_cwd,
-                )
-            self.cwd = safe_cwd
+        # a previous tool call that ran ``rm -rf`` on its own working dir.
+        # ``execute`` resolves before wrapper generation; keep this second guard
+        # for direct ``_run_bash`` callers and to keep Popen's cwd valid.
+        self._resolve_effective_cwd(self.cwd)
 
         _popen_cwd = self.cwd
 
@@ -2167,6 +2148,33 @@ class LocalEnvironment(BaseEnvironment):
             _pipe_stdin(proc, stdin_data)
 
         return proc
+
+    def _resolve_effective_cwd(self, cwd: str) -> str:
+        """Resolve stale local cwd before both wrapper generation and Popen.
+
+        ``BaseEnvironment.execute`` embeds ``cwd`` in the generated shell
+        wrapper before calling ``_run_bash``. If the local process cwd has been
+        deleted, ``_run_bash`` can recover the ``Popen(cwd=...)`` value, but
+        the wrapper must be recovered too or bash exits 126 on its first
+        ``builtin cd``. Keep the warning here so wrapper and spawn recovery
+        stay classified consistently by watchdogs.
+        """
+        safe_cwd = _resolve_safe_cwd(cwd)
+        if safe_cwd != cwd:
+            # MSYS → Windows translation alone shouldn't surface as a warning
+            # (it's a benign normalization, not a recovery). Only warn when
+            # the directory really doesn't exist on disk.
+            normalized = _msys_to_windows_path(cwd) if _IS_WINDOWS else cwd
+            if safe_cwd != normalized:
+                logger.warning(
+                    "LocalEnvironment cwd %r is missing on disk; "
+                    "falling back to %r so terminal commands keep working.",
+                    cwd,
+                    safe_cwd,
+                )
+            if cwd == self.cwd:
+                self.cwd = safe_cwd
+        return safe_cwd
 
     def _kill_process(self, proc):
         """Kill the entire process group (all children)."""
