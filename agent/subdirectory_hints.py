@@ -90,7 +90,12 @@ class SubdirectoryHintTracker:
         self._loaded_digests: Set[str] = set()
         # Pre-mark the working dir as loaded (startup context handles it)
         self._loaded_dirs.add(self.working_dir)
-        self._seed_working_dir_digest()
+        # Gateway workers must reach the model even when their working
+        # directory is backed by a slow or wedged filesystem. Startup context
+        # is already loaded by prompt_builder; this digest only prevents a
+        # later duplicate hint and is not worth blocking an inbound message.
+        if os.environ.get("_HERMES_GATEWAY") != "1":
+            self._seed_working_dir_digest()
 
     def _seed_working_dir_digest(self) -> None:
         """Record the CWD context file's digest so it is never re-injected.
