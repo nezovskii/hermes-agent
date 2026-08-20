@@ -239,6 +239,13 @@ class TestContentDeduplication:
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
         assert tracker.check_tool_call("read_file", {"path": str(elsewhere / "f.py")}) is None
 
+    def test_gateway_init_skips_working_dir_digest_io(self, tmp_path, monkeypatch):
+        """Gateway workers must not block on working-directory context I/O."""
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        with patch.object(SubdirectoryHintTracker, "_seed_working_dir_digest") as seed:
+            SubdirectoryHintTracker(working_dir=str(tmp_path))
+        seed.assert_not_called()
+
 
 class TestExcludedDirectories:
     """Backups, vendored deps, and caches hold copies — never context."""
