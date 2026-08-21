@@ -2619,6 +2619,8 @@ from gateway.restart import (
 )
 from gateway.shutdown_notice_cleanup import (
     cleanup_shutdown_notices,
+    delete_recorded_lifecycle_notice,
+    record_lifecycle_notice,
     record_shutdown_notice,
 )
 
@@ -13052,8 +13054,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._start_loop_heartbeat_task()
 
-        # The previous process could only send, not later retract, its Telegram
-        # shutdown banner. Remove it now that adapters are connected again.
+        # The previous process could only send, not later retract, its
+        # Telegram/Slack lifecycle banners. Remove them now that adapters are
+        # connected again.
         await cleanup_shutdown_notices(_hermes_home, self.adapters)
 
         # Emit gateway:startup hook
@@ -24062,6 +24065,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return True
 
+    def _record_and_schedule_lifecycle_notice(
+        self,
+        platform: Platform,
+        adapter: BasePlatformAdapter,
+        chat_id: str,
+        result: Any,
+        *,
+        kind: str,
+        delay_seconds: float = 30.0,
+    ) -> bool:
+        """Persist and later retract a healthy-process lifecycle notice."""
+        recorded = record_lifecycle_notice(
+            _hermes_home,
+            platform,
+            str(chat_id),
+            result,
+            kind=kind,
+        )
+        message_id = getattr(result, "message_id", None)
+        if not recorded or message_id in (None, ""):
+            return False
+
+        task = asyncio.create_task(
+            delete_recorded_lifecycle_notice(
+                _hermes_home,
+                platform,
+                adapter,
+                str(chat_id),
+                str(message_id),
+                delay_seconds=delay_seconds,
+            )
+        )
+        if getattr(self, "_background_tasks", None) is None:
+            self._background_tasks = set()
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return True
+
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
         """Notify the chat that initiated /restart that the gateway is back."""
         notify_path = _hermes_home / ".restart_notify.json"
@@ -24128,6 +24169,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     getattr(result, "error", "send returned success=False"),
                 )
                 return None
+
+            if not transport.is_relay:
+                self._record_and_schedule_lifecycle_notice(
+                    platform,
+                    transport.adapter,
+                    str(chat_id),
+                    result,
+                    kind="restart-complete",
+                )
 
             logger.info(
                 "Sent restart notification to %s:%s",
@@ -24207,6 +24257,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         getattr(result, "error", "send returned success=False"),
                     )
                     continue
+
+                if not transport.is_relay:
+                    self._record_and_schedule_lifecycle_notice(
+                        platform,
+                        transport.adapter,
+                        str(home.chat_id),
+                        result,
+                        kind="startup-online",
+                    )
 
                 delivered.add(target)
                 logger.info(

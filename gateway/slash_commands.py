@@ -1625,8 +1625,14 @@ class GatewaySlashCommandsMixin:
         if self._restart_requested or self._draining:
             count = self._running_agent_count()
             if count:
-                return t("gateway.draining", count=count)
-            return EphemeralReply(t("gateway.restart.in_progress"))
+                return EphemeralReply(
+                    t("gateway.draining", count=count),
+                    cleanup_on_restart=True,
+                )
+            return EphemeralReply(
+                t("gateway.restart.in_progress"),
+                cleanup_on_restart=True,
+            )
 
         # Save the requester's routing info so the new gateway process can
         # notify them once it comes back online.
@@ -1708,8 +1714,14 @@ class GatewaySlashCommandsMixin:
         else:
             self.request_restart(detached=True, via_service=False)
         if active_agents:
-            return t("gateway.draining", count=active_agents)
-        return EphemeralReply(t("gateway.restart.restarting"))
+            return EphemeralReply(
+                t("gateway.draining", count=active_agents),
+                cleanup_on_restart=True,
+            )
+        return EphemeralReply(
+            t("gateway.restart.restarting"),
+            cleanup_on_restart=True,
+        )
 
     async def _handle_version_command(self, event: MessageEvent) -> str:
         """Handle /version — show the running Hermes Agent version."""
