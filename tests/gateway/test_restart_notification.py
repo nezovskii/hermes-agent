@@ -53,6 +53,7 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
 
     result = await runner._handle_restart_command(event)
     assert "Restarting" in result
+    assert getattr(result, "cleanup_on_restart", False) is True
 
     notify_path = tmp_path / ".restart_notify.json"
     assert notify_path.exists()
