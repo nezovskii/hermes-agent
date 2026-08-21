@@ -800,12 +800,13 @@ async def test_shutdown_banner_is_persisted_for_cleanup_after_restart(
     payload = json.loads(
         (tmp_path / "state" / "gateway-shutdown-notice-cleanup.json").read_text()
     )
-    assert payload["version"] == 1
+    assert payload["version"] == 2
     assert payload["notices"] == [
         {
             "platform": "telegram",
             "chat_id": "home-42",
             "message_id": "1",
+            "kind": "shutdown",
             "created_at": payload["notices"][0]["created_at"],
         }
     ]

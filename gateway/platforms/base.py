@@ -2411,14 +2411,24 @@ class EphemeralReply(str):
     silently ignore the TTL — the message is sent normally and left in
     place.  When ``ttl_seconds`` is ``None``, the pipeline uses the
     configured ``display.ephemeral_system_ttl`` default.  A default of ``0``
-    disables auto-deletion globally, preserving prior behavior.
+    disables TTL auto-deletion globally, preserving prior behavior.
+    ``cleanup_on_restart=True`` is separate: it durably records lifecycle
+    replies so the next gateway process can remove them even when TTL is off.
     """
 
     ttl_seconds: Optional[int]
+    cleanup_on_restart: bool
 
-    def __new__(cls, text: str, ttl_seconds: Optional[int] = None):
+    def __new__(
+        cls,
+        text: str,
+        ttl_seconds: Optional[int] = None,
+        *,
+        cleanup_on_restart: bool = False,
+    ):
         instance = super().__new__(cls, text)
         instance.ttl_seconds = ttl_seconds
+        instance.cleanup_on_restart = cleanup_on_restart
         return instance
 
     @property
@@ -3767,6 +3777,40 @@ class BasePlatformAdapter(ABC):
             # path).  Close the coroutine cleanly so Python doesn't warn
             # about it never being awaited, then drop silently.
             coro.close()
+
+    async def _record_restart_cleanup_reply(
+        self,
+        response: Any,
+        event: MessageEvent,
+        result: "SendResult",
+    ) -> None:
+        """Persist a restart-command reply before this gateway exits.
+
+        An ordinary ephemeral TTL task is process-local and dies with the
+        restart.  ``cleanup_on_restart`` opts only lifecycle replies into the
+        durable queue consumed by the next process.
+        """
+        if not getattr(response, "cleanup_on_restart", False):
+            return
+        if not result.success or not result.message_id:
+            return
+        try:
+            from gateway.shutdown_notice_cleanup import record_lifecycle_notice
+
+            await asyncio.to_thread(
+                record_lifecycle_notice,
+                get_hermes_home(),
+                self.platform,
+                event.source.chat_id,
+                result,
+                kind="restart-request",
+            )
+        except Exception:
+            logger.debug(
+                "[%s] Failed to persist restart reply cleanup record",
+                self.name,
+                exc_info=True,
+            )
 
     # ── Shared interactive-prompt formatting cores ─────────────────────────
     # Template attrs for ``_format_exec_approval``. Adapters override these to
@@ -5637,6 +5681,7 @@ class BasePlatformAdapter(ABC):
                     reply_to=_reply_anchor_for_event(event),
                     metadata=_mark_notify_metadata(thread_meta),
                 )
+                await self._record_restart_cleanup_reply(response, event, _r)
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
                         chat_id=event.source.chat_id,
@@ -5753,6 +5798,7 @@ class BasePlatformAdapter(ABC):
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_mark_notify_metadata(_thread_meta),
                         )
+                        await self._record_restart_cleanup_reply(response, event, _r)
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
                                 chat_id=event.source.chat_id,
@@ -5806,6 +5852,7 @@ class BasePlatformAdapter(ABC):
                                 reply_to=_reply_anchor_for_event(event),
                                 metadata=_mark_notify_metadata(_thread_meta),
                             )
+                            await self._record_restart_cleanup_reply(response, event, _r)
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(
                                     chat_id=event.source.chat_id,
@@ -5948,6 +5995,7 @@ class BasePlatformAdapter(ABC):
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
             is_ephemeral_response = isinstance(response, EphemeralReply)
+            restart_cleanup_response = response if is_ephemeral_response else None
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
@@ -6210,6 +6258,12 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    if restart_cleanup_response is not None:
+                        await delivery_adapter._record_restart_cleanup_reply(
+                            restart_cleanup_response,
+                            event,
+                            result,
+                        )
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (

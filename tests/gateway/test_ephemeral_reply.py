@@ -21,6 +21,7 @@ Covered:
 """
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -244,5 +245,44 @@ async def test_process_message_incapable_platform_does_not_schedule_delete():
     # Monkeypatching the instance does NOT change the class, so this test
     # verifies the gate uses the class method to detect capability.
     assert delete_calls == []
+
+
+@pytest.mark.asyncio
+async def test_restart_reply_is_durably_recorded_even_when_ttl_is_disabled(
+    tmp_path,
+):
+    """The restart kills its TTL task, so its ack must survive in the queue."""
+    adapter = _delete_adapter()
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="restart-ack-1")
+    )
+
+    async def _handler(evt):
+        return EphemeralReply(
+            "♻ Restarting gateway.",
+            cleanup_on_restart=True,
+        )
+
+    adapter.set_message_handler(_handler)
+    event = _make_event(text="/restart")
+    session_key = "agent:main:telegram:private:42"
+    with patch(
+        "gateway.platforms.base.get_hermes_home",
+        return_value=tmp_path,
+    ), patch.object(adapter, "_keep_typing", new=AsyncMock()):
+        await adapter._process_message_background(event, session_key)
+
+    payload = json.loads(
+        (tmp_path / "state" / "gateway-shutdown-notice-cleanup.json").read_text()
+    )
+    assert payload["notices"] == [
+        {
+            "platform": "telegram",
+            "chat_id": "42",
+            "message_id": "restart-ack-1",
+            "kind": "restart-request",
+            "created_at": payload["notices"][0]["created_at"],
+        }
+    ]
 
 
