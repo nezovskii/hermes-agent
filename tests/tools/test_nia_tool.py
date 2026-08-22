@@ -71,6 +71,26 @@ def test_api_key_falls_back_to_config_file(monkeypatch, tmp_path):
     assert nia._check_nia_available() is True
 
 
+def test_api_key_config_file_is_read_as_utf8(monkeypatch, tmp_path):
+    nia = reload_nia(monkeypatch, tmp_path, env_key=None)
+    key_file = tmp_path / ".config" / "nia" / "api_key"
+    key_file.parent.mkdir(parents=True)
+    key_file.write_text("file-secret\n", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    original_read_text = Path.read_text
+    read_text_kwargs = {}
+
+    def track_read_text(path, *args, **kwargs):
+        read_text_kwargs.update(kwargs)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", track_read_text)
+
+    assert nia._get_api_key() == "file-secret"
+    assert read_text_kwargs["encoding"] == "utf-8"
+
+
 def test_nia_usage_sends_auth_header_and_redacts_errors(monkeypatch, tmp_path):
     nia = reload_nia(monkeypatch, tmp_path, env_key="secret-token")
     captured = capture_request(monkeypatch, b'{"tier":"pro"}')
