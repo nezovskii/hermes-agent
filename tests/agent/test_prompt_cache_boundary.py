@@ -376,5 +376,5 @@ class TestCronBuilder:
         )[0]["content"]
 
         assert first_blocks[0] == second_blocks[0]
-        assert "could not be found" in first_blocks[0]["text"]
+        assert "could not be loaded" in first_blocks[0]["text"]
         assert first_blocks[1]["text"].endswith("ticket=one")

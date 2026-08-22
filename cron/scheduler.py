@@ -4512,7 +4512,11 @@ def _build_job_prompt(
             continue
         if not loaded.get("success"):
             error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
-            logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
+            logger.warning(
+                "Cron job '%s': skill unavailable, skipping - %s",
+                job.get("name", job.get("id")),
+                error,
+            )
             skipped.append(skill_name)
             continue
 
@@ -4535,10 +4539,10 @@ def _build_job_prompt(
 
     if skipped:
         notice = (
-            f"[IMPORTANT: The following skill(s) were listed for this job but could not be found "
+            f"[IMPORTANT: The following skill(s) were listed for this job but could not be loaded "
             f"and were skipped: {', '.join(skipped)}. "
             f"Start your response with a brief notice so the user is aware, e.g.: "
-            f"'⚠️ Skill(s) not found and skipped: {', '.join(skipped)}']"
+            f"'⚠️ Skill(s) unavailable and skipped: {', '.join(skipped)}']"
         )
         parts.insert(0, notice)
 

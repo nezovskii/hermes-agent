@@ -1208,21 +1208,41 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     active_org = read_active_org_id(skills_dir)
     org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
     matches: list[str] = []
-    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
-        has_skill_md = "SKILL.md" in files
-        if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
-            dirs.remove(ORG_MIRROR_DIR_NAME)
-        elif root == org_root:
-            # Inside _org/: descend ONLY into the active org's mirror.
-            dirs[:] = [d for d in dirs if d == active_org]
-        dirs[:] = [
-            d
-            for d in dirs
-            if d not in EXCLUDED_SKILL_DIRS
-            and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
-        ]
-        if filename in files:
-            matches.append(os.path.join(root, filename))
+
+    def _log_walk_error(exc: OSError) -> None:
+        logger.warning(
+            "Skipping unreadable skill directory under %s: %s",
+            skills_dir,
+            exc,
+        )
+
+    try:
+        for root, dirs, files in os.walk(
+            skills_dir_str,
+            followlinks=True,
+            onerror=_log_walk_error,
+        ):
+            has_skill_md = "SKILL.md" in files
+            if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
+                dirs.remove(ORG_MIRROR_DIR_NAME)
+            elif root == org_root:
+                # Inside _org/: descend ONLY into the active org's mirror.
+                dirs[:] = [d for d in dirs if d == active_org]
+            dirs[:] = [
+                d
+                for d in dirs
+                if d not in EXCLUDED_SKILL_DIRS
+                and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
+            ]
+            if filename in files:
+                matches.append(os.path.join(root, filename))
+    except OSError as exc:
+        # ``os.walk`` normally routes directory-read failures through
+        # ``onerror``. Some filesystems can still surface EINTR/EIO directly
+        # from the generator. One unavailable optional skill root must not
+        # abort discovery in every healthy root.
+        _log_walk_error(exc)
+
     for path in sorted(matches):
         yield Path(path)
 
