@@ -160,7 +160,13 @@ async def test_pending_voice_interrupt_reuses_transcript_and_echo():
             drain_transcripts,
         )
 
-    assert interrupt_text == '"hello once"'
+    assert interrupt_text is not None
+    # Voice transcripts are deliberately wrapped as internal, no-echo context
+    # for the agent.  The user-visible transcript echo remains the short
+    # quoted form asserted below.
+    assert '<voice_message_transcript internal="true" do_not_echo="true">' in interrupt_text
+    assert "hello once" in interrupt_text
+    assert "</voice_message_transcript>" in interrupt_text
     assert drain_text == interrupt_text
     assert drain_transcripts == interrupt_transcripts == ["hello once"]
     mock_transcribe.assert_called_once_with("/tmp/telegram-voice.ogg", None, "gateway")
@@ -215,7 +221,17 @@ async def test_monitor_to_drain_transcribes_and_echoes_pending_voice_once(
         )
 
     assert result["final_response"] == "follow-up complete"
-    assert _PendingVoiceAgent.messages == ["initial turn", '"hello once"']
+    # The drain must reuse the cached internal transcript context rather than
+    # perform another transcription or alter the agent-facing prompt.
+    assert _PendingVoiceAgent.messages == [
+        "initial turn",
+        '<voice_message_transcript internal="true" do_not_echo="true">\n'
+        "The user sent a voice message. Use this transcript only to understand "
+        "and answer the user's intent. Do not quote, repeat, summarize, or mention "
+        "the transcript/wrapper unless the user explicitly asks for the transcript.\n"
+        "hello once\n"
+        "</voice_message_transcript>",
+    ]
     mock_transcribe.assert_called_once_with("/tmp/telegram-pending-voice.ogg", None, "gateway")
     assert adapter.sent == [("12345", '🎙️ "hello once"', None)]
 

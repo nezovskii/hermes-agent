@@ -24,7 +24,13 @@ pytestmark = pytest.mark.asyncio
 
 async def dispatch(adapter, msg):
     await adapter._handle_message(msg)
-    await asyncio.sleep(E2E_MESSAGE_SETTLE_DELAY)
+    # Discord delegates into BasePlatformAdapter's background processing task.
+    # A fixed 300ms sleep races the delivery ledger/worker handoff on CI; wait
+    # for that task to complete instead of guessing its latency.
+    for _ in range(40):
+        if not adapter._background_tasks:
+            break
+        await asyncio.sleep(E2E_MESSAGE_SETTLE_DELAY / 6)
 
 
 class TestMentionStrippedCommandDispatch:
