@@ -3798,6 +3798,66 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
+def _snapshot_posix_descendant_groups(root_pids: set[int]) -> tuple[set[int], set[int]]:
+    """Return live descendants and process groups rooted at known PIDs.
+
+    A cron script may spawn a child with ``start_new_session=True``. That child
+    leaves the script's process group, so killing only the cron PGID leaks the
+    detached subtree when the outer script timeout fires. Keep every previously
+    observed PID as a root so descendants remain discoverable after an ancestor
+    exits and the OS reparents them.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set(root_pids), set()
+    if result.returncode != 0:
+        return set(root_pids), set()
+
+    rows: list[tuple[int, int, int]] = []
+    for raw in result.stdout.splitlines():
+        parts = raw.split()
+        if len(parts) != 3:
+            continue
+        try:
+            pid, ppid, pgid = map(int, parts)
+            rows.append((pid, ppid, pgid))
+        except ValueError:
+            continue
+
+    descendants = set(root_pids)
+    changed = True
+    while changed:
+        changed = False
+        for pid, ppid, _pgid in rows:
+            if ppid in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    groups = {pgid for pid, _ppid, pgid in rows if pid in descendants}
+    return descendants, groups
+
+
+def _signal_posix_process_tree(known_pids: set[int], sig: signal.Signals) -> set[int]:
+    """Signal every process group in a possibly multi-session descendant tree."""
+    discovered, groups = _snapshot_posix_descendant_groups(known_pids)
+    known_pids.update(discovered)
+    own_group = os.getpgrp()
+    for process_group in groups:
+        if process_group <= 0 or process_group == own_group:
+            continue
+        try:
+            os.killpg(process_group, sig)  # windows-footgun: ok — POSIX-only caller
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    return known_pids
+
+
 def _terminate_cron_script_process(proc: subprocess.Popen) -> None:
     """Best-effort hard stop of a cron script and every child it spawned."""
     if proc.poll() is not None:
@@ -3814,38 +3874,30 @@ def _terminate_cron_script_process(proc: subprocess.Popen) -> None:
         except (OSError, subprocess.TimeoutExpired):
             proc.kill()
     else:
+        known_pids = {proc.pid}
+        _signal_posix_process_tree(known_pids, signal.SIGTERM)
         try:
-            process_group: Optional[int] = os.getpgid(proc.pid)
-        except (ProcessLookupError, OSError):
-            process_group = None
-        if process_group is not None:
-            try:
-                os.killpg(process_group, signal.SIGTERM)  # windows-footgun: ok — POSIX-only branch (win32 handled above)
-            except (ProcessLookupError, PermissionError, OSError):
-                process_group = None
-            if process_group is not None:
-                try:
-                    proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    pass
-                # Escalate whenever ANY group member survived the TERM: a
-                # TERM-ignoring descendant keeps the stdio pipe write ends
-                # open, and the caller's communicate() would then block on
-                # EOF forever.  killpg(pgid, 0) probes group liveness.
-                try:
-                    os.killpg(process_group, 0)  # windows-footgun: ok — POSIX-only branch
-                except (ProcessLookupError, OSError):
-                    process_group = None
-                if process_group is not None:
-                    try:
-                        os.killpg(process_group, getattr(signal, "SIGKILL", signal.SIGTERM))
-                    except (ProcessLookupError, PermissionError, OSError):
-                        pass
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+        # Re-scan from every PID observed before TERM. This catches children
+        # that created their own session as well as grandchildren discovered
+        # after the script parent exited and was reparented by the OS.
+        _signal_posix_process_tree(
+            known_pids,
+            getattr(signal, "SIGKILL", signal.SIGTERM),
+        )
     try:
         proc.wait(timeout=1.0)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=1.0)
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def _drain_script_pipes(proc: subprocess.Popen) -> None:
