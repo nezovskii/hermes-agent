@@ -202,11 +202,20 @@ class TestAuthorization:
     async def test_unauthorized_user_gets_pairing_response(self, adapter, runner, platform):
         """Unauthorized DM should trigger pairing code, not a command response."""
         runner._is_user_authorized = lambda _source: False
+        # Telegram's secure default is to stay silent for unpaired DMs.  This
+        # test is specifically the explicit opt-in pairing path, so configure
+        # that policy rather than inheriting a platform default.
+        runner._get_unauthorized_dm_behavior = lambda *_args, **_kwargs: "pair"
 
         event = make_event(platform, "/help")
         adapter.send.reset_mock()
         await adapter.handle_message(event)
-        await asyncio.sleep(0.3)
+        # Authorization replies use the same background adapter path as
+        # commands, so a fixed sleep can race the delivery worker on CI.
+        for _ in range(40):
+            if adapter.send.called:
+                break
+            await asyncio.sleep(0.05)
 
         # The adapter.send is called directly by the authorization path
         # (not via _send_with_retry), so check it was called with a pairing message
@@ -222,7 +231,10 @@ class TestAuthorization:
         event = make_event(platform, "/help")
         adapter.send.reset_mock()
         await adapter.handle_message(event)
-        await asyncio.sleep(0.3)
+        for _ in range(40):
+            if adapter.send.called:
+                break
+            await asyncio.sleep(0.05)
 
         # If send was called, it should NOT contain the help text
         if adapter.send.called:
@@ -242,6 +254,12 @@ class TestSendFailureResilience:
         event = make_event(platform, "/help")
         # Should not raise — pipeline handles send failures internally
         await adapter.handle_message(event)
-        await asyncio.sleep(0.3)
+        # The adapter returns immediately after scheduling background command
+        # processing.  Wait for its first send attempt rather than racing it
+        # with a fixed delay; retries may continue after this assertion.
+        for _ in range(40):
+            if adapter.send.called:
+                break
+            await asyncio.sleep(0.05)
 
         adapter.send.assert_called()
