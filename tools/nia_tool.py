@@ -53,7 +53,7 @@ def _get_api_key() -> str:
     if env_key:
         return env_key
     try:
-        return (Path.home() / ".config" / "nia" / "api_key").read_text().strip()
+        return (Path.home() / ".config" / "nia" / "api_key").read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError):
         return ""
 
