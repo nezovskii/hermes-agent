@@ -24,8 +24,14 @@ jobs:
       - name: Check for unmapped contributor emails
         id: check-emails
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # PRs compare with the exact target SHA from the triggering event.
+          # Direct pushes retain the historical main comparison.
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            BASE_COMMIT="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE_COMMIT="origin/main"
+          fi
+          MERGE_BASE=$(git merge-base "$BASE_COMMIT" HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
