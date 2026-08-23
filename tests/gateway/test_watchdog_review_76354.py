@@ -81,6 +81,71 @@ def test_s1_clear_labels_noop_skips_transaction(tmp_path, monkeypatch):
     assert activity["last_activity_description"] == ""
 
 
+def test_s1_clear_labels_noop_read_is_serialized_with_close():
+    """The no-op SELECT must not race another thread closing ``_conn``.
+
+    CPython's sqlite3 connection permits cross-thread use in SessionDB. A
+    concurrent ``Connection.close()`` while ``execute()`` is inside SQLite is
+    therefore a native-crash boundary, not a catchable Python exception.
+    """
+    read_started = threading.Event()
+    release_read = threading.Event()
+    close_done = threading.Event()
+    failures: list[BaseException] = []
+
+    class _Cursor:
+        @staticmethod
+        def fetchone():
+            return ("", ActivityProvenance.UNKNOWN.value)
+
+    class _BlockingConnection:
+        closed = False
+
+        def execute(self, *_args, **_kwargs):
+            read_started.set()
+            assert release_read.wait(timeout=5)
+            if self.closed:
+                raise RuntimeError("connection closed during execute")
+            return _Cursor()
+
+        def close(self):
+            self.closed = True
+
+    conn = _BlockingConnection()
+    db = SessionDB.__new__(SessionDB)
+    db._lock = threading.Lock()
+    db.__dict__["_conn"] = conn
+
+    def _clear():
+        try:
+            db.clear_session_activity_labels("S1_CLOSE_RACE")
+        except BaseException as exc:  # captured so the test owns thread failure
+            failures.append(exc)
+
+    def _close_like_sessiondb():
+        assert read_started.wait(timeout=5)
+        with db._lock:
+            conn.close()
+        close_done.set()
+
+    clear_thread = threading.Thread(target=_clear)
+    close_thread = threading.Thread(target=_close_like_sessiondb)
+    clear_thread.start()
+    assert read_started.wait(timeout=5)
+    close_thread.start()
+    try:
+        assert not close_done.wait(timeout=0.1), (
+            "close acquired SessionDB._lock while the no-op SELECT was still running"
+        )
+    finally:
+        release_read.set()
+        clear_thread.join(timeout=5)
+        close_thread.join(timeout=5)
+
+    assert failures == []
+    assert close_done.is_set()
+
+
 def test_s1_contended_clear_gives_up_within_short_budget(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     sid = "S1_CLEAR_CONTENDED"

@@ -7854,13 +7854,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         from agent.session_activity import ActivityProvenance
 
         # No-op fast path: skip the transaction when there is nothing to
-        # clear. Read-only, no write lock.
+        # clear. The SELECT still uses the shared writer connection, so it
+        # MUST hold ``_lock``: AIAgent.close() can close that same connection
+        # from a sibling delegation-cleanup thread. CPython's sqlite3 releases
+        # the GIL inside execute/close; overlapping them is a native segfault
+        # boundary rather than a catchable ProgrammingError (#89724).
         try:
-            row = self._conn.execute(
-                "SELECT last_activity_description, last_activity_provenance "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
+            with self._lock:
+                if self._conn is None:
+                    return
+                row = self._conn.execute(
+                    "SELECT last_activity_description, last_activity_provenance "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
         except sqlite3.Error:
             row = None
         if row is not None:
