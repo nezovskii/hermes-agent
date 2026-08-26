@@ -239,7 +239,7 @@ class TestBuildJobPromptScansSkillContent:
         # Should not raise — missing skills are skipped with a notice.
         prompt = scheduler._build_job_prompt(job)
         assert prompt is not None
-        assert "could not be found" in prompt
+        assert "could not be loaded" in prompt
 
 
     def test_bundle_name_shadows_skill_name_for_cron_jobs(self, cron_env):

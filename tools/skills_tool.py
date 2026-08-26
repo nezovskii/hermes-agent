@@ -1333,10 +1333,12 @@ def skill_view(
                     _record(found_skill_md.parent, found_skill_md)
 
             # Strategy 3: legacy flat <name>.md files anywhere under the dir.
-            # Exclude skill support docs: references/templates/assets/scripts
-            # are loaded through skill_view(skill, file_path=...) and must not
-            # shadow or collide with real skills that share the same basename.
-            for found_md in search_dir.rglob(f"{name}.md"):
+            # Reuse the guarded walker so an unavailable optional skill root
+            # cannot abort resolution of a healthy local skill. Exclude skill
+            # support docs: references/templates/assets/scripts are loaded
+            # through skill_view(skill, file_path=...) and must not shadow or
+            # collide with real skills that share the same basename.
+            for found_md in iter_skill_index_files(search_dir, f"{name}.md"):
                 if found_md.name != "SKILL.md" and not _is_skill_support_path(
                     found_md
                 ):

@@ -409,6 +409,42 @@ class TestSkillView:
         assert result["success"] is True
         assert result["name"] == "knowledge-brain"
 
+    def test_view_local_skill_survives_unreadable_external_root(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        local_root = tmp_path / "local"
+        external_root = tmp_path / "external"
+        local_root.mkdir()
+        external_root.mkdir()
+        _make_skill(local_root, "body-lawyer")
+
+        real_walk = os.walk
+        walked_roots = []
+
+        def flaky_walk(top, *args, **kwargs):
+            root = Path(top).resolve()
+            walked_roots.append(root)
+            if root == external_root.resolve():
+                raise InterruptedError(4, "Interrupted system call", str(external_root))
+            return real_walk(top, *args, **kwargs)
+
+        monkeypatch.setattr("agent.skill_utils.os.walk", flaky_walk)
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_root),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[external_root],
+            ),
+            caplog.at_level("WARNING", logger="agent.skill_utils"),
+        ):
+            result = json.loads(skill_view("body-lawyer"))
+
+        assert result["success"] is True
+        assert result["name"] == "body-lawyer"
+        assert external_root.resolve() in walked_roots
+        assert "Skipping unreadable skill directory" in caplog.text
+        assert str(external_root) in caplog.text
+
 
 class TestSkillViewSecureSetupOnLoad:
     def test_requests_missing_required_env_and_continues(self, tmp_path, monkeypatch):
