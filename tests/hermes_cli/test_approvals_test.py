@@ -99,6 +99,25 @@ class TestVerdicts:
         rc = at.approvals_test_command(_args(["sudo", "re" + "boot"]))
         assert rc == 3
 
+    def test_safe_inspection_pipeline_uses_permanent_glob(self, isolated_approvals,
+                                                          capsys):
+        A.load_permanent({"git *"})
+        command = "git -C /tmp status --short | sed -n '1,20p'"
+        rc = at.approvals_test_command(_args(command.split()))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "permanently approved" in out
+
+    def test_unsafe_inspection_pipeline_asks_even_with_permanent_glob(
+        self, isolated_approvals, capsys,
+    ):
+        A.load_permanent({"git *"})
+        command = "git status | grep modified /etc/passwd"
+        rc = at.approvals_test_command(_args(command.split()))
+        out = capsys.readouterr().out
+        assert rc == 2
+        assert "unsafe inspection-pipeline filter" in out
+
 
 class TestNormalizationParity:
     """The tester must run the same de-obfuscation path as the runtime."""

@@ -130,6 +130,14 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
                    "(permanently approved)",
         )
 
+    if approval._inspection_pipeline_requires_approval(command):
+        return result(
+            "ask-approval",
+            rule=approval._UNSAFE_INSPECTION_PIPELINE_KEY,
+            detail=("matches an unsafe inspection-pipeline filter; the runtime "
+                    "would raise an approval prompt"),
+        )
+
     # 7. Dangerous-pattern detection → would prompt.
     is_dangerous, pattern_key, description = approval.detect_dangerous_command(command)
     if is_dangerous:

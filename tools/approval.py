@@ -8,6 +8,7 @@ This module is the single source of truth for the dangerous command system:
 - Permanent allowlist persistence (config.yaml)
 """
 
+import ast
 import contextlib
 import contextvars
 import fnmatch
@@ -3076,6 +3077,390 @@ _REINTERPRETED_ARGUMENT_RE = re.compile(
     r"(?:^|[ \t])(?:-[^-\s]*[ce]|--(?:command|eval))(?:[= \t]|$)"
 )
 
+_INSPECTION_GIT_VERBS = frozenset({"show", "diff", "log", "status"})
+_INSPECTION_GH_RESOURCES = frozenset({"pr", "issue"})
+_INSPECTION_GH_VERBS = frozenset({"view", "list", "diff"})
+_INSPECTION_FILTERS = frozenset({"grep", "sed", "awk", "jq", "python3"})
+_SAFE_PYTHON_MODULES = frozenset({
+    "collections", "itertools", "json", "math", "re", "sys", "textwrap",
+})
+_SAFE_PYTHON_BUILTINS = frozenset({
+    "abs", "all", "any", "bool", "dict", "enumerate", "filter", "float",
+    "int", "len", "list", "map", "max", "min", "print", "range", "repr",
+    "round", "set", "sorted", "str", "sum", "tuple", "zip",
+})
+_SAFE_PYTHON_METHODS = frozenset({
+    "casefold", "count", "decode", "encode", "endswith", "find", "format",
+    "get", "index", "items", "join", "keys", "lower", "lstrip", "read",
+    "readline", "readlines", "replace", "rfind", "rindex", "rstrip", "split",
+    "splitlines", "startswith", "strip", "upper", "values",
+})
+
+
+def _split_single_inspection_pipeline(command: str) -> tuple[str, str] | None:
+    """Split one safe-looking pipeline, rejecting shell syntax around it."""
+    quote: str | None = None
+    escaped = False
+    pipe_at: int | None = None
+    for i, ch in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and quote != "'":
+            # Reject escapes rather than trying to emulate every shell quoting
+            # rule. This keeps an escaped operator from changing meaning later.
+            return None
+        if quote:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            continue
+        if ch in ";&<>`\n\r":
+            return None
+        if ch == "$" and i + 1 < len(command) and command[i + 1] == "(":
+            return None
+        if ch == "|":
+            if pipe_at is not None or (
+                i + 1 < len(command) and command[i + 1] in "|&"
+            ) or (i and command[i - 1] == "|"):
+                return None
+            pipe_at = i
+    if quote is not None or pipe_at is None:
+        return None
+    parts = [command[:pipe_at].strip(), command[pipe_at + 1:].strip()]
+    if not all(parts):
+        return None
+    return parts[0], parts[1]
+
+
+def _split_unquoted_inspection_pipeline(command: str) -> tuple[str, str] | None:
+    """Split one unquoted pipe without requiring the rest to be safe syntax."""
+    quote: str | None = None
+    escaped = False
+    pipe_at: int | None = None
+    for i, ch in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '\"'):
+            quote = ch
+        elif ch == "|":
+            if (
+                pipe_at is not None
+                or (i and command[i - 1] == "|")
+                or (i + 1 < len(command) and command[i + 1] in "|&")
+            ):
+                return None
+            pipe_at = i
+    if quote is not None or pipe_at is None:
+        return None
+    left, right = command[:pipe_at].strip(), command[pipe_at + 1:].strip()
+    return (left, right) if left and right else None
+
+
+def _split_shell_words(text: str) -> list[str] | None:
+    try:
+        words = shlex.split(text, posix=True)
+    except ValueError:
+        return None
+    return words if words else None
+
+
+def _safe_inspection_source(words: list[str]) -> bool:
+    if not words:
+        return False
+    executable = os.path.basename(words[0])
+    if executable == "git":
+        # Permit the two common read-only global forms without allowing config
+        # injection or pager execution: ``git -C <repo> status`` and
+        # ``git --no-pager diff``.
+        verb_index = 1
+        while verb_index < len(words):
+            word = words[verb_index]
+            if word == "-C":
+                if verb_index + 1 >= len(words):
+                    return False
+                verb_index += 2
+                continue
+            if word == "--no-pager":
+                verb_index += 1
+                continue
+            break
+        if verb_index >= len(words) or words[verb_index] not in _INSPECTION_GIT_VERBS:
+            return False
+        # Do not permit config/exec indirection or output-producing options.
+        forbidden = {"-c", "--config-env", "--ext-diff", "--textconv", "--output"}
+        return not any(
+            word in forbidden
+            or word.startswith(("--config-env=", "--output="))
+            or word == "-o"
+            or word.startswith("-o") and not word.startswith("--")
+            or word.startswith("-c") and word != "--color"
+            for word in words[verb_index + 1:]
+        )
+    if executable != "gh" or len(words) < 3:
+        return False
+    if words[1] not in _INSPECTION_GH_RESOURCES or words[2] not in _INSPECTION_GH_VERBS:
+        return False
+    return "--web" not in words[3:]
+
+
+class _SafePythonInspection(ast.NodeVisitor):
+    """Conservative AST allowlist for stdin-only Python transforms."""
+
+    def __init__(self) -> None:
+        self.valid = True
+
+    def generic_visit(self, node):
+        if not self.valid:
+            return
+        if isinstance(node, (
+            ast.AsyncFunctionDef, ast.AsyncFor, ast.AsyncWith, ast.Await, ast.ClassDef,
+            ast.Delete, ast.FunctionDef, ast.Global, ast.Nonlocal, ast.Raise, ast.Try,
+            ast.TryStar, ast.With, ast.Yield, ast.YieldFrom,
+        )):
+            self.valid = False
+            return
+        super().generic_visit(node)
+
+    def visit_Import(self, node):
+        self.valid = all(alias.name in _SAFE_PYTHON_MODULES for alias in node.names)
+
+    def visit_ImportFrom(self, node):
+        self.valid = bool(node.module in _SAFE_PYTHON_MODULES) and all(
+            alias.name != "*" and not alias.name.startswith("_") for alias in node.names
+        )
+
+    def visit_Name(self, node):
+        if node.id.startswith("__"):
+            self.valid = False
+
+    def visit_Attribute(self, node):
+        if node.attr.startswith("_"):
+            self.valid = False
+            return
+        if isinstance(node.ctx, ast.Store):
+            self.valid = False
+            return
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        target = node.func
+        allowed = False
+        if isinstance(target, ast.Name):
+            allowed = target.id in _SAFE_PYTHON_BUILTINS
+        elif isinstance(target, ast.Attribute):
+            if target.attr in _SAFE_PYTHON_METHODS:
+                allowed = True
+            elif isinstance(target.value, ast.Name):
+                allowed = target.value.id in _SAFE_PYTHON_MODULES
+        if not allowed:
+            self.valid = False
+            return
+        self.generic_visit(node)
+
+
+def _safe_python_transform(words: list[str]) -> bool:
+    if len(words) != 3 or words[1] != "-c":
+        return False
+    try:
+        tree = ast.parse(words[2], mode="exec")
+    except SyntaxError:
+        return False
+    checker = _SafePythonInspection()
+    checker.visit(tree)
+    return checker.valid
+
+
+_SAFE_GREP_SHORT_OPTIONS = frozenset("EFGPinvcoqswx")
+_SAFE_GREP_LONG_OPTIONS = frozenset({
+    "--basic-regexp", "--extended-regexp", "--fixed-strings", "--perl-regexp",
+    "--ignore-case", "--invert-match", "--line-number", "--count",
+    "--only-matching", "--quiet", "--word-regexp", "--line-regexp",
+})
+_SAFE_JQ_SHORT_OPTIONS = frozenset("acejMRrSs")
+_SAFE_JQ_LONG_OPTIONS = frozenset({
+    "--ascii-output", "--compact-output", "--exit-status", "--join-output",
+    "--monochrome-output", "--raw-input", "--raw-output", "--seq", "--slurp",
+    "--sort-keys", "--stream", "--unbuffered",
+})
+_SED_ADDRESS = r"(?:\d+|\$|/[^/\n]*/|\\?.)"
+_SED_SIMPLE_COMMAND_RE = re.compile(
+    rf"^\s*(?:{_SED_ADDRESS}(?:\s*,\s*{_SED_ADDRESS})?\s*)?[pdq=]\s*$"
+)
+
+
+def _safe_grep_transform(words: list[str]) -> bool:
+    positional: list[str] = []
+    for word in words[1:]:
+        if word == "--":
+            # Supporting ``--`` would require remembering parser state. Keep the
+            # accepted grammar small rather than accidentally treating files as
+            # stdin-only patterns.
+            return False
+        if word.startswith("--"):
+            if word == "--color=never":
+                continue
+            if word not in _SAFE_GREP_LONG_OPTIONS:
+                return False
+            continue
+        if word.startswith("-") and word != "-":
+            if not word[1:] or any(ch not in _SAFE_GREP_SHORT_OPTIONS for ch in word[1:]):
+                return False
+            continue
+        positional.append(word)
+    # One pattern and no file operands: the pipeline remains stdin-only.
+    return len(positional) == 1
+
+
+def _safe_sed_script(script: str) -> bool:
+    if _SED_SIMPLE_COMMAND_RE.fullmatch(script):
+        return True
+    if not script.startswith("s") or len(script) < 4:
+        return False
+    delimiter = script[1]
+    if delimiter.isalnum() or delimiter.isspace() or delimiter == "\\":
+        return False
+    escaped = False
+    separators: list[int] = []
+    for index, char in enumerate(script[2:], start=2):
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == delimiter:
+            separators.append(index)
+            if len(separators) == 2:
+                break
+    if len(separators) != 2:
+        return False
+    flags = script[separators[1] + 1:]
+    # ``e`` executes and ``w`` writes. Permit only display-oriented flags.
+    return all(char in "gIp0123456789" for char in flags)
+
+
+def _safe_sed_transform(words: list[str]) -> bool:
+    scripts: list[str] = []
+    for word in words[1:]:
+        if word in {"-n", "--quiet", "--silent", "-E", "-r", "--regexp-extended", "-u", "--unbuffered"}:
+            continue
+        if word.startswith("-"):
+            return False
+        scripts.append(word)
+    # One script and no file operands: sed can only transform pipeline stdin.
+    return len(scripts) == 1 and _safe_sed_script(scripts[0])
+
+
+def _safe_awk_transform(words: list[str]) -> bool:
+    index = 1
+    if index < len(words) and words[index] == "-F":
+        if index + 1 >= len(words):
+            return False
+        index += 2
+    elif index < len(words) and words[index].startswith("-F") and len(words[index]) > 2:
+        index += 1
+    if len(words) - index != 1:
+        return False
+    program = words[index].lower()
+    return not any(token in program for token in (
+        "system", "getline", "@include", "fflush", "close(", "|", ">",
+    ))
+
+
+def _safe_jq_transform(words: list[str]) -> bool:
+    positional: list[str] = []
+    index = 1
+    while index < len(words):
+        word = words[index]
+        if word in {"--arg", "--argjson"}:
+            if index + 2 >= len(words):
+                return False
+            index += 3
+            continue
+        if word == "--indent":
+            if index + 1 >= len(words) or words[index + 1] not in {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}:
+                return False
+            index += 2
+            continue
+        if word.startswith("--"):
+            if word not in _SAFE_JQ_LONG_OPTIONS:
+                return False
+            index += 1
+            continue
+        if word.startswith("-") and word != "-":
+            if not word[1:] or any(ch not in _SAFE_JQ_SHORT_OPTIONS for ch in word[1:]):
+                return False
+            index += 1
+            continue
+        positional.append(word)
+        index += 1
+    # One jq program and no input files. File-loading options are not accepted.
+    return len(positional) == 1
+
+
+def _safe_inspection_filter(words: list[str]) -> bool:
+    if not words or any(word in {";", "&", "<", ">", "`"} for word in words):
+        return False
+    executable = os.path.basename(words[0])
+    if executable not in _INSPECTION_FILTERS:
+        return False
+    if executable == "python3":
+        return _safe_python_transform(words)
+    if executable == "grep":
+        return _safe_grep_transform(words)
+    if executable == "sed":
+        return _safe_sed_transform(words)
+    if executable == "awk":
+        return _safe_awk_transform(words)
+    if executable == "jq":
+        return _safe_jq_transform(words)
+    return False
+
+
+_UNSAFE_INSPECTION_PIPELINE_KEY = "unsafe read-only inspection pipeline filter"
+_UNSAFE_INSPECTION_PIPELINE_DESCRIPTION = (
+    "read-only Git/GitHub pipeline has a write-capable or unrestricted filter"
+)
+
+
+def _inspection_pipeline_requires_approval(command: str) -> bool:
+    """Identify unsafe filter variants that must not fall through ungated."""
+    split = _split_unquoted_inspection_pipeline(command)
+    if split is None:
+        return False
+    source, downstream = split
+    source_words = _split_shell_words(source)
+    downstream_words = _split_shell_words(downstream)
+    if not source_words or not downstream_words or not _safe_inspection_source(source_words):
+        return False
+    if os.path.basename(downstream_words[0]) not in _INSPECTION_FILTERS:
+        return False
+    return not _safe_inspection_filter(downstream_words)
+
+
+def _is_safe_read_only_inspection_pipeline(command: str) -> bool:
+    """Return True only for a one-stage, read-only inspection transform."""
+    split = _split_single_inspection_pipeline(command)
+    if split is None:
+        return False
+    source, downstream = split
+    source_words = _split_shell_words(source)
+    downstream_words = _split_shell_words(downstream)
+    return bool(
+        source_words and downstream_words
+        and _safe_inspection_source(source_words)
+        and _safe_inspection_filter(downstream_words)
+    )
+
 
 def _has_allowlist_shell_operator(command: str) -> bool:
     """Return True when a command is too compound for the allowlist shortcut.
@@ -3152,9 +3537,6 @@ def _command_matches_permanent_allowlist(command: str) -> bool:
     command = (command or "").strip()
     if not command:
         return False
-    if _has_allowlist_shell_operator(command):
-        return False
-
     with _lock:
         patterns = tuple(_permanent_approved)
 
@@ -3164,10 +3546,18 @@ def _command_matches_permanent_allowlist(command: str) -> bool:
         pattern = pattern.strip()
         if not pattern:
             continue
-        if command == pattern:
+        matches = command == pattern or (
+            any(ch in pattern for ch in "*?[")
+            and fnmatch.fnmatchcase(command, pattern)
+        )
+        if not matches:
+            continue
+        if not _has_allowlist_shell_operator(command):
             return True
-        if any(ch in pattern for ch in "*?[") and fnmatch.fnmatchcase(command, pattern):
-            return True
+        # Compound commands remain rejected by default. This explicit,
+        # structural exception is the only route for a persistent pipeline
+        # grant, and it is limited to read-only Git/GitHub inspection filters.
+        return _is_safe_read_only_inspection_pipeline(command)
     return False
 
 
@@ -4134,6 +4524,23 @@ def check_dangerous_command(command: str, env_type: str,
     if _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
+    if _inspection_pipeline_requires_approval(command):
+        return _run_approval_gate(
+            pattern_key=_UNSAFE_INSPECTION_PIPELINE_KEY,
+            description=_UNSAFE_INSPECTION_PIPELINE_DESCRIPTION,
+            display_target=command,
+            approval_callback=approval_callback,
+            cron_deny_message=(
+                "BLOCKED: unsafe inspection pipeline requires approval, but "
+                "cron jobs run without a user present to approve it."
+            ),
+            single_query_deny_message=(
+                "BLOCKED: unsafe inspection pipeline requires approval, but "
+                "single-query mode runs without a user present to approve it."
+            ),
+            autoapprove_log_prefix="unsafe inspection pipeline",
+        )
+
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     if not is_dangerous:
         return {"approved": True, "message": None}
@@ -5042,6 +5449,7 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Dangerous command check (detection only, no approval)
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    inspection_requires_approval = _inspection_pipeline_requires_approval(command)
 
     # --- Phase 2: Decide ---
 
@@ -5065,6 +5473,17 @@ def check_all_command_guards(command: str, env_type: str,
     if is_dangerous:
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
+
+    if inspection_requires_approval and not is_approved(
+        session_key, _UNSAFE_INSPECTION_PIPELINE_KEY
+    ):
+        # Treat this like a content-level security warning: session approval
+        # is possible, but it is never permanently allowlisted.
+        warnings.append((
+            _UNSAFE_INSPECTION_PIPELINE_KEY,
+            _UNSAFE_INSPECTION_PIPELINE_DESCRIPTION,
+            True,
+        ))
 
     # Nothing to warn about
     if not warnings:
