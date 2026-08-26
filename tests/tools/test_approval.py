@@ -1898,3 +1898,58 @@ class TestLifecycleGuardLaunchctlParity:
             "launchctl print system/com.apple.WindowServer",
         ):
             assert contains_gateway_lifecycle_command(cmd) is False, cmd
+
+
+class TestPermanentInspectionPipelineAllowlist:
+    """Persistent globs may bypass prompts only for stdin-only inspection."""
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "git status | grep -n modified",
+            "git -C /tmp status --short | sed -n '1,20p'",
+            "git --no-pager diff --stat | awk '{print $1}'",
+            "gh pr view 42 --json title | jq -r '.title'",
+            "git log -1 | python3 -c 'import sys; print(sys.stdin.read())'",
+        ),
+    )
+    def test_safe_stdin_only_pipeline_matches_permanent_glob(self, command):
+        with mock_patch.object(approval_module, "_permanent_approved", {"git *", "gh *"}):
+            assert approval_module._is_safe_read_only_inspection_pipeline(command) is True
+            assert approval_module._command_matches_permanent_allowlist(command) is True
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "git status | grep modified /etc/passwd",
+            "git status | grep -R modified /etc",
+            "git status | sed -n '1p' /etc/passwd",
+            "git status | sed 'e id'",
+            "git status | awk '{print $1}' /etc/passwd",
+            "git status | awk '{system(\"id\")}'",
+            "gh pr view 1 --json title | jq -r '.title' /etc/passwd",
+            "gh pr view 1 --json title | jq --rawfile secret /etc/passwd '.'",
+            "git status | python3 -c 'import os'",
+            "git status | python3 -c 'open(\"/tmp/pwned\", \"w\")'",
+            "git -c alias.x=!id x | grep modified",
+            "git diff --output=/tmp/diff | grep modified",
+            "gh pr view 42 --web | grep modified",
+            "git status | grep modified | sed -n '1p'",
+        ),
+    )
+    def test_write_capable_or_file_reading_filter_never_matches(self, command):
+        with mock_patch.object(approval_module, "_permanent_approved", {"git *", "gh *"}):
+            assert approval_module._is_safe_read_only_inspection_pipeline(command) is False
+            assert approval_module._command_matches_permanent_allowlist(command) is False
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "git status | grep modified /etc/passwd",
+            "git status | sed 'e id'",
+            "gh pr view 1 --json title | jq --rawfile secret /etc/passwd '.'",
+            "git status | python3 -c 'import os'",
+        ),
+    )
+    def test_unsafe_known_filter_is_forced_back_through_approval(self, command):
+        assert approval_module._inspection_pipeline_requires_approval(command) is True
