@@ -3282,6 +3282,10 @@ def _safe_python_transform(words: list[str]) -> bool:
 
 
 _SAFE_GREP_SHORT_OPTIONS = frozenset("EFGPinvcoqswx")
+_SAFE_GREP_CONTEXT_SHORT_OPTIONS = frozenset({"-A", "-B", "-C"})
+_SAFE_GREP_CONTEXT_LONG_OPTIONS = frozenset({
+    "--after-context", "--before-context", "--context",
+})
 _SAFE_GREP_LONG_OPTIONS = frozenset({
     "--basic-regexp", "--extended-regexp", "--fixed-strings", "--perl-regexp",
     "--ignore-case", "--invert-match", "--line-number", "--count",
@@ -3301,23 +3305,53 @@ _SED_SIMPLE_COMMAND_RE = re.compile(
 
 def _safe_grep_transform(words: list[str]) -> bool:
     positional: list[str] = []
-    for word in words[1:]:
+    index = 1
+    while index < len(words):
+        word = words[index]
         if word == "--":
             # Supporting ``--`` would require remembering parser state. Keep the
             # accepted grammar small rather than accidentally treating files as
             # stdin-only patterns.
             return False
+        if word in _SAFE_GREP_CONTEXT_SHORT_OPTIONS:
+            # Context counts are option arguments, not file operands.
+            if index + 1 >= len(words) or not words[index + 1].isdigit():
+                return False
+            index += 2
+            continue
+        if any(
+            word.startswith(option) and word[len(option):].isdigit()
+            for option in _SAFE_GREP_CONTEXT_SHORT_OPTIONS
+        ):
+            # GNU grep accepts the common attached forms: -A55, -B20, -C3.
+            index += 1
+            continue
         if word.startswith("--"):
+            if word in _SAFE_GREP_CONTEXT_LONG_OPTIONS:
+                if index + 1 >= len(words) or not words[index + 1].isdigit():
+                    return False
+                index += 2
+                continue
+            option, separator, value = word.partition("=")
+            if option in _SAFE_GREP_CONTEXT_LONG_OPTIONS:
+                if not separator or not value.isdigit():
+                    return False
+                index += 1
+                continue
             if word == "--color=never":
+                index += 1
                 continue
             if word not in _SAFE_GREP_LONG_OPTIONS:
                 return False
+            index += 1
             continue
         if word.startswith("-") and word != "-":
             if not word[1:] or any(ch not in _SAFE_GREP_SHORT_OPTIONS for ch in word[1:]):
                 return False
+            index += 1
             continue
         positional.append(word)
+        index += 1
     # One pattern and no file operands: the pipeline remains stdin-only.
     return len(positional) == 1
 
@@ -3433,17 +3467,25 @@ _UNSAFE_INSPECTION_PIPELINE_DESCRIPTION = (
 
 
 def _inspection_pipeline_requires_approval(command: str) -> bool:
-    """Identify unsafe filter variants that must not fall through ungated."""
+    """Identify Git/GitHub pipelines that must not fall through ungated."""
     split = _split_unquoted_inspection_pipeline(command)
     if split is None:
         return False
     source, downstream = split
     source_words = _split_shell_words(source)
     downstream_words = _split_shell_words(downstream)
-    if not source_words or not downstream_words or not _safe_inspection_source(source_words):
+    if not source_words or not downstream_words:
+        return False
+    if os.path.basename(source_words[0]) not in {"git", "gh"}:
         return False
     if os.path.basename(downstream_words[0]) not in _INSPECTION_FILTERS:
         return False
+    # A filter is only eligible for the permanent read-only exception when the
+    # upstream Git/GitHub command is itself structurally read-only. This keeps
+    # write-capable verbs such as `git commit | grep ...` approval-gated even
+    # when a broad `git *` pattern is permanently approved.
+    if not _safe_inspection_source(source_words):
+        return True
     return not _safe_inspection_filter(downstream_words)
 
 

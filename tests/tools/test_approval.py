@@ -2074,6 +2074,14 @@ class TestPermanentInspectionPipelineAllowlist:
             "git --no-pager diff --stat | awk '{print $1}'",
             "gh pr view 42 --json title | jq -r '.title'",
             "git log -1 | python3 -c 'import sys; print(sys.stdin.read())'",
+            "git -C /tmp show HEAD | grep -n 'changed'",
+            "git -C /tmp diff | grep -n modified",
+            "git -C /tmp log | grep -i modified",
+            "git -C /tmp status --short | grep -v clean",
+            "git show origin/develop:apps/os/convex/workspaceResources.ts | grep -n -A55 -B20 'const whiteboards\\|parentPageId: board.parentPageId\\|whiteboards,'",
+            "git -C /Users/nezovskii/workspace/actvox-repos/research-actvox show origin/develop:apps/os/convex/__tests__/workspacePagePropertyUnset.test.ts | grep -n -C 3 'person arrays\\|multiple\\|notification'",
+            "git -C /tmp diff | grep -E -i -A 2 -B 1 'changed\\|added'",
+            "git -C /tmp log | grep -F -v -C3 'secret'",
         ),
     )
     def test_safe_stdin_only_pipeline_matches_permanent_glob(self, command):

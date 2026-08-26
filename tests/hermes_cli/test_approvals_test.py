@@ -108,6 +108,21 @@ class TestVerdicts:
         assert rc == 0
         assert "permanently approved" in out
 
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "git show origin/develop:apps/os/convex/workspaceResources.ts | grep -n -A55 -B20 'const whiteboards\\|parentPageId: board.parentPageId\\|whiteboards,'",
+            "git -C /Users/nezovskii/workspace/actvox-repos/research-actvox show origin/develop:apps/os/convex/__tests__/workspacePagePropertyUnset.test.ts | grep -n -C 3 'person arrays\\|multiple\\|notification'",
+        ),
+    )
+    def test_exact_grep_regressions_allow_with_git_glob(self, command,
+                                                         isolated_approvals, capsys):
+        A.load_permanent({"git *"})
+        rc = at.approvals_test_command(_args(command))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "allow" in out
+
     def test_unsafe_inspection_pipeline_asks_even_with_permanent_glob(
         self, isolated_approvals, capsys,
     ):
@@ -117,6 +132,25 @@ class TestVerdicts:
         out = capsys.readouterr().out
         assert rc == 2
         assert "unsafe inspection-pipeline filter" in out
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "git show HEAD | grep -n -A55 -B20 'changed' /tmp/input",
+            "git -C /tmp show HEAD | grep -n -C 3 -f /tmp/patterns",
+            "git -C /tmp commit -am update | grep -n changed",
+            "git -C /tmp show HEAD | grep -n changed > /tmp/result",
+        ),
+    )
+    def test_unsafe_grep_or_upstream_variants_ask_with_git_glob(
+        self, command, isolated_approvals, capsys,
+    ):
+        A.load_permanent({"git *"})
+        rc = at.approvals_test_command(_args(command))
+        out = capsys.readouterr().out
+        assert rc == 2
+        assert "ask-approval" in out
+
 
 
 class TestNormalizationParity:
