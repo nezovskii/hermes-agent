@@ -151,6 +151,39 @@ class TestVerdicts:
         assert rc == 2
         assert "ask-approval" in out
 
+    @pytest.mark.parametrize(
+        "command",
+        (
+            'git -C /tmp show origin/main:package.json | python3 -c "import json,sys; print(json.load(sys.stdin))"',
+            "git show origin/main:package.json | python3 -c 'import json,sys; print(json.loads(sys.stdin.read()))'",
+        ),
+    )
+    def test_git_c_show_python_allows_with_git_show_glob(
+        self, command, isolated_approvals, capsys,
+    ):
+        A.load_permanent({"git show*"})
+        rc = at.approvals_test_command(_args(command))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "allow" in out
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "python3 -c 'import json,sys; json.load(sys.stdin)'",
+            "git -C /tmp show HEAD:package.json | python3 -c 'open(\"/tmp/pwned\", \"w\")'",
+            "git show HEAD:file | python3 -c 'import subprocess; subprocess.call([\"id\"])'",
+        ),
+    )
+    def test_bare_or_write_capable_python_asks_with_git_show_glob(
+        self, command, isolated_approvals, capsys,
+    ):
+        A.load_permanent({"git show*"})
+        rc = at.approvals_test_command(_args(command))
+        out = capsys.readouterr().out
+        assert rc == 2
+        assert "ask-approval" in out
+
 
 
 class TestNormalizationParity:

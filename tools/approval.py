@@ -3175,6 +3175,65 @@ def _split_shell_words(text: str) -> list[str] | None:
     return words if words else None
 
 
+def _git_subcommand_index(words: list[str]) -> int | None:
+    """Index of the git subcommand after read-only global options.
+
+    Only ``-C <path>`` and ``--no-pager`` are skipped. Config/exec globals
+    such as ``-c`` stay in place so they cannot inherit a ``git show*`` grant.
+    """
+    if not words or os.path.basename(words[0]) != "git":
+        return None
+    index = 1
+    while index < len(words):
+        word = words[index]
+        if word == "-C":
+            if index + 1 >= len(words):
+                return None
+            index += 2
+            continue
+        if word == "--no-pager":
+            index += 1
+            continue
+        break
+    if index >= len(words):
+        return None
+    return index
+
+
+def _strip_git_readonly_globals_from_command(command: str) -> str | None:
+    """Return *command* with leading ``git -C <path>`` / ``--no-pager`` removed.
+
+    Permanent globs such as ``git show*`` must treat
+    ``git -C <repo> show <ref>:<file>`` as the same shape as ``git show ...``.
+    The original command is unchanged when no such globals are present or the
+    leading argv is not git. Downstream pipeline text is preserved verbatim.
+    """
+    source = command
+    suffix = ""
+    pipeline = _split_unquoted_inspection_pipeline(command)
+    if pipeline is not None:
+        source, downstream = pipeline
+        suffix = " | " + downstream
+    words = _split_shell_words(source)
+    verb_index = _git_subcommand_index(words) if words else None
+    if words is None or verb_index is None or verb_index == 1:
+        return None
+    return " ".join([words[0], *words[verb_index:]]) + suffix
+
+
+def _allowlist_command_candidates(command: str) -> tuple[str, ...]:
+    """Command forms that may match a permanent glob.
+
+    Includes the original text plus a git-global-stripped variant so
+    ``git -C <repo> show ...`` can match ``git show*``.
+    """
+    candidates = [command]
+    stripped = _strip_git_readonly_globals_from_command(command)
+    if stripped and stripped != command:
+        candidates.append(stripped)
+    return tuple(candidates)
+
+
 def _safe_inspection_source(words: list[str]) -> bool:
     if not words:
         return False
@@ -3183,19 +3242,8 @@ def _safe_inspection_source(words: list[str]) -> bool:
         # Permit the two common read-only global forms without allowing config
         # injection or pager execution: ``git -C <repo> status`` and
         # ``git --no-pager diff``.
-        verb_index = 1
-        while verb_index < len(words):
-            word = words[verb_index]
-            if word == "-C":
-                if verb_index + 1 >= len(words):
-                    return False
-                verb_index += 2
-                continue
-            if word == "--no-pager":
-                verb_index += 1
-                continue
-            break
-        if verb_index >= len(words) or words[verb_index] not in _INSPECTION_GIT_VERBS:
+        verb_index = _git_subcommand_index(words)
+        if verb_index is None or words[verb_index] not in _INSPECTION_GIT_VERBS:
             return False
         # Do not permit config/exec indirection or output-producing options.
         forbidden = {"-c", "--config-env", "--ext-diff", "--textconv", "--output"}
@@ -3582,15 +3630,17 @@ def _command_matches_permanent_allowlist(command: str) -> bool:
     with _lock:
         patterns = tuple(_permanent_approved)
 
+    candidates = _allowlist_command_candidates(command)
     for pattern in patterns:
         if not isinstance(pattern, str):
             continue
         pattern = pattern.strip()
         if not pattern:
             continue
-        matches = command == pattern or (
-            any(ch in pattern for ch in "*?[")
-            and fnmatch.fnmatchcase(command, pattern)
+        glob = any(ch in pattern for ch in "*?[")
+        matches = any(
+            candidate == pattern or (glob and fnmatch.fnmatchcase(candidate, pattern))
+            for candidate in candidates
         )
         if not matches:
             continue

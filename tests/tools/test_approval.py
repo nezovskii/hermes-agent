@@ -2124,3 +2124,35 @@ class TestPermanentInspectionPipelineAllowlist:
     )
     def test_unsafe_known_filter_is_forced_back_through_approval(self, command):
         assert approval_module._inspection_pipeline_requires_approval(command) is True
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            'git -C /tmp show origin/main:package.json | python3 -c "import json,sys; print(json.load(sys.stdin))"',
+            "git show origin/main:package.json | python3 -c 'import json,sys; print(json.loads(sys.stdin.read()))'",
+            "git --no-pager -C /tmp show HEAD:file | python3 -c 'import sys,json; print(json.load(sys.stdin))'",
+            "git -C /tmp --no-pager show origin/main:package.json | python3 -c 'import json,sys; json.load(sys.stdin)'",
+        ),
+    )
+    def test_git_c_show_python_matches_git_show_glob(self, command):
+        with mock_patch.object(approval_module, "_permanent_approved", {"git show*"}):
+            assert approval_module._is_safe_read_only_inspection_pipeline(command) is True
+            assert approval_module._command_matches_permanent_allowlist(command) is True
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "python3 -c 'import json,sys; json.load(sys.stdin)'",
+            "git -C /tmp show HEAD:package.json | python3 -c 'import os'",
+            "git -C /tmp show HEAD:package.json | python3 -c 'open(\"/tmp/pwned\", \"w\")'",
+            "git show HEAD:file | python3 -c 'import subprocess; subprocess.call([\"id\"])'",
+            "git -C /tmp show HEAD:file | python3 -c 'import os; os.system(\"id\")'",
+            "git show HEAD:file | python3 -c 'from pathlib import Path; Path(\"/tmp/x\").write_text(\"a\")'",
+            "git -C /tmp show HEAD:file | python3 -c 'import shutil; shutil.copy(\"/etc/passwd\", \"/tmp/x\")'",
+            "git -C /tmp commit -am update | python3 -c 'import json,sys; json.load(sys.stdin)'",
+            "git status | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+        ),
+    )
+    def test_unsafe_or_bare_python_never_matches_git_show_glob(self, command):
+        with mock_patch.object(approval_module, "_permanent_approved", {"git show*"}):
+            assert approval_module._command_matches_permanent_allowlist(command) is False
