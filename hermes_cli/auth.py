@@ -1978,6 +1978,27 @@ def _adopt_oauth_material(target: Dict[str, Any], winner: Dict[str, Any]) -> Dic
     return merged
 
 
+def _preserve_missing_refresh_token(
+    target: Dict[str, Any], source: Dict[str, Any]
+) -> Tuple[Dict[str, Any], bool]:
+    """Carry the sole refresh token without replacing fresher access material.
+
+    Access-only shadows can legitimately have a later JWT expiry than the
+    refresh owner. Freshness alone must never make consolidation discard the
+    only refresh-capable copy of a single-use OAuth grant.
+    """
+    target_refresh = target.get("refresh_token")
+    source_refresh = source.get("refresh_token")
+    if (
+        isinstance(target_refresh, str)
+        and target_refresh.strip()
+    ) or not (isinstance(source_refresh, str) and source_refresh.strip()):
+        return target, False
+    merged = dict(target)
+    merged["refresh_token"] = source_refresh
+    return merged, True
+
+
 def _singleton_as_row(path: Path) -> Optional[Dict[str, Any]]:
     """Read a ``.anthropic_oauth.json`` as a pool-row-shaped dict, or None."""
     try:
@@ -2051,7 +2072,13 @@ def _heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str,
         logger.debug("%s: forked-OAuth heal skipped, %s is the root store", provider_id, profile_path)
         return None
 
-    summary: Dict[str, Any] = {"adopted": False, "stripped_ids": [], "files": [], "providers_block": False}
+    summary: Dict[str, Any] = {
+        "adopted": False,
+        "preserved_refresh": False,
+        "stripped_ids": [],
+        "files": [],
+        "providers_block": False,
+    }
     log_bits: List[str] = []
 
     # Lock order: active (profile) store first, then the root source store —
@@ -2090,6 +2117,12 @@ def _heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str,
                         r_rows[match_idx] = _adopt_oauth_material(root_row, row)
                         root_changed = True
                         summary["adopted"] = True
+                    else:
+                        merged, preserved = _preserve_missing_refresh_token(root_row, row)
+                        if preserved:
+                            r_rows[match_idx] = merged
+                            root_changed = True
+                            summary["preserved_refresh"] = True
                     summary["stripped_ids"].append(row.get("id"))
                     profile_changed = True
                     continue
@@ -2124,8 +2157,16 @@ def _heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str,
                 else:
                     p_block = r_block = None
                 if isinstance(p_block, dict) and p_block and isinstance(r_block, dict) and r_block:
-                    p_tokens = p_block.get("tokens") if isinstance(p_block.get("tokens"), dict) else {}
-                    r_tokens = r_block.get("tokens") if isinstance(r_block.get("tokens"), dict) else {}
+                    p_tokens: Dict[str, Any] = (
+                        dict(p_block.get("tokens"))
+                        if isinstance(p_block.get("tokens"), dict)
+                        else {}
+                    )
+                    r_tokens: Dict[str, Any] = (
+                        dict(r_block.get("tokens"))
+                        if isinstance(r_block.get("tokens"), dict)
+                        else {}
+                    )
                     p_flat = {**p_tokens, "last_refresh": p_block.get("last_refresh")}
                     r_flat = {**r_tokens, "last_refresh": r_block.get("last_refresh")}
                     p_ident, r_ident = _oauth_identity(p_flat), _oauth_identity(r_flat)
@@ -2135,6 +2176,16 @@ def _heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str,
                             r_providers[provider_id] = dict(p_block)
                             root_changed = True
                             summary["adopted"] = True
+                        else:
+                            merged_tokens, preserved = _preserve_missing_refresh_token(
+                                r_tokens, p_tokens
+                            )
+                            if preserved:
+                                merged_block = dict(r_block)
+                                merged_block["tokens"] = merged_tokens
+                                r_providers[provider_id] = merged_block
+                                root_changed = True
+                                summary["preserved_refresh"] = True
                         del p_providers[provider_id]
                         profile_changed = True
                         summary["providers_block"] = True
@@ -2223,7 +2274,12 @@ def _heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str,
         log_bits.append(", ".join(summary["files"]))
     verdict = (
         "profile copy was the live pair; root updated"
-        if summary["adopted"] else "root copy already newest; profile copy dropped"
+        if summary["adopted"]
+        else (
+            "root kept newer access and recovered missing refresh token"
+            if summary["preserved_refresh"]
+            else "root copy already newest; profile copy dropped"
+        )
     )
     message = (
         f"profile {profile_home.name}: consolidated forked {provider_id} OAuth grant "
