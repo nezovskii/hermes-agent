@@ -67,9 +67,11 @@ class SubdirectoryHintTracker:
         # symlinks/hardlinks/copies is never re-sent. Seeded with the CWD hint
         # file prompt_builder already loaded.
         self._loaded_digests: Set[str] = set()
-        found = _first_hint_file(self.working_dir)
-        if found and found[1]:
-            self._loaded_digests.add(_digest(found[1]))
+        # Startup already loaded context; do not block gateway workers on disk.
+        if os.environ.get("_HERMES_GATEWAY") != "1":
+            found = _first_hint_file(self.working_dir)
+            if found and found[1]:
+                self._loaded_digests.add(_digest(found[1]))
 
     def check_tool_call(self, tool_name: str, tool_args: Dict[str, Any]) -> Optional[str]:
         """Return formatted hint text for newly visited directories, or None."""
