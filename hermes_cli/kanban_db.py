@@ -2919,6 +2919,15 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+        # External prerequisites without unfinished parents must not respawn immediately.
+        if kind == "dependency":
+            unfinished_parent = conn.execute(
+                "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if unfinished_parent is None:
+                kind = "needs_input"
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
