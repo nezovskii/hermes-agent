@@ -67,7 +67,11 @@ _CODING_TOOLS = _core_without("image_generate", "text_to_speech", "cronjob_manag
 
 # Core toolset definitions: individual tools or references to other toolsets.
 TOOLSETS = {
-    # Basic toolsets - individual tool categories
+    # Basic toolsets - individual capabilities
+    "nia": _ts(
+        "Nia external retrieval/search for indexed repositories, sources and research",
+        ["nia_usage", "nia_repos", "nia_sources", "nia_context", "nia_search"],
+    ),
     "web": _ts("Web research and content extraction tools", ["web_search", "web_extract"]),
     "search": _ts("Web search only (no content extraction/scraping)", ["web_search"]),
     "x_search": _ts(
