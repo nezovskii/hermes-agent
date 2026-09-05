@@ -67,6 +67,9 @@ def sanitize_gemini_schema(schema: Any) -> Dict[str, Any]:
             cleaned.pop("required", None)
         elif len(valid_required) != len(required_val):
             cleaned["required"] = valid_required
+    # Bare MCP arrays still need an item schema for Gemini.
+    if cleaned.get("type") == "array" and not isinstance(cleaned.get("items"), dict):
+        cleaned["items"] = {"type": "object", "properties": {}}
     return cleaned
 
 
