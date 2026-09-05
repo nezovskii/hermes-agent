@@ -49,6 +49,7 @@ def _make_fake_popen(captured: dict, fds: list):
     caller can clean up after the test.
     """
     def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
         captured["cwd"] = kwargs.get("cwd")
         captured["env"] = kwargs.get("env", {})
         read_fd, write_fd = os.pipe()
@@ -102,6 +103,14 @@ class TestRunBashCwdRecovery:
         # Popen must have been handed a real, existing directory.
         assert captured["cwd"] == str(tmp_path)
         assert os.path.isdir(captured["cwd"])
+
+        # The generated shell wrapper must also cd to the recovered directory.
+        # Otherwise Popen starts successfully in the fallback cwd, but bash then
+        # immediately exits 126 trying to cd into the deleted worktree path.
+        script = captured["cmd"][-1]
+        expected_cwd = env._quote_cwd_for_cd(str(tmp_path))
+        assert f"builtin cd -- {expected_cwd} || exit 126" in script
+        assert str(wedged) not in script
 
         # ``self.cwd`` is updated so the next call doesn't re-warn.
         assert env.cwd == str(tmp_path)

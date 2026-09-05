@@ -511,6 +511,9 @@ class BaseEnvironment(ABC):
             exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
             effective_stdin = None
 
+        # Backends that recover a vanished spawn cwd must do so before this
+        # wrapper embeds its own ``builtin cd`` target.
+        effective_cwd = self._resolve_effective_cwd(effective_cwd)
         wrapped = self._wrap_command(exec_command, effective_cwd)
 
         # Login shell if the snapshot failed (so the user's profile still
@@ -580,6 +583,15 @@ class BaseEnvironment(ABC):
             logger.debug("terminal wait-bound kill_process_tree failed", exc_info=True)
 
     # --- Shared helpers ---
+    def _resolve_effective_cwd(self, cwd: str) -> str:
+        """Return the cwd to embed in the shell wrapper.
+
+        Local execution overrides this to recover a deleted cwd before both
+        wrapper creation and ``Popen(cwd=...)``. Other backends retain the
+        caller-provided path.
+        """
+        return cwd
+
     def __del__(self):
         try:
             self.cleanup()

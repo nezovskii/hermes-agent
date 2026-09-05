@@ -782,7 +782,9 @@ class LocalEnvironment(BaseEnvironment):
         if login:
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
-        self._recover_cwd()
+        # ``execute`` resolves before wrapper generation; retain this guard for
+        # direct callers and so Popen receives the same recovered directory.
+        self._resolve_effective_cwd(self.cwd)
         proc = subprocess.Popen(
             args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -795,6 +797,28 @@ class LocalEnvironment(BaseEnvironment):
         if stdin_data is not None:
             _pipe_stdin(proc, stdin_data)
         return proc
+
+    def _resolve_effective_cwd(self, cwd: str) -> str:
+        """Resolve stale local cwd before both wrapper generation and Popen.
+
+        ``BaseEnvironment.execute`` embeds ``cwd`` in the shell wrapper before
+        calling ``_run_bash``. Recovering only Popen's cwd leaves a stale
+        ``builtin cd`` in that wrapper, which exits 126 despite a successful
+        spawn.
+        """
+        safe_cwd = _resolve_safe_cwd(cwd)
+        if safe_cwd != cwd:
+            normalized = _msys_to_windows_path(cwd) if _IS_WINDOWS else cwd
+            if safe_cwd != normalized:
+                logger.warning(
+                    "LocalEnvironment cwd %r is missing on disk; "
+                    "falling back to %r so terminal commands keep working.",
+                    cwd,
+                    safe_cwd,
+                )
+            if cwd == self.cwd:
+                self.cwd = safe_cwd
+        return safe_cwd
 
     def _kill_process(self, proc):
         """Kill the entire process group (all children)."""
