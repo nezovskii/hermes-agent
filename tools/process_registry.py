@@ -1861,13 +1861,32 @@ class ProcessRegistry:
         return self.kill_all(task_id, exclude_ids=frozenset(baseline_ids or ()), source=source, consume_output=True)
 
     def kill_all(
-        self, task_id: Optional[str] = None, *, exclude_ids: frozenset = frozenset(),
-        source: str = "kill_all", consume_output: bool = False) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+        self,
+        task_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+        *,
+        exclude_ids: frozenset = frozenset(),
+        source: str = "kill_all",
+        consume_output: bool = False,
+    ) -> int:
+        """Kill owned running processes and return the count killed.
+
+        When both ownership selectors are supplied, matching either is
+        intentional: terminal processes may share ``task_id='default'`` but
+        retain their originating agent in ``session_key``. ``exclude_ids``
+        preserves processes that predate a per-turn cleanup boundary.
+        """
         with self._lock:
             targets = [
-                s for s in self._running.values()
-                if (task_id is None or s.task_id == task_id) and s.id not in exclude_ids and not s.exited
+                s
+                for s in self._running.values()
+                if not s.exited
+                and s.id not in exclude_ids
+                and (
+                    (task_id is None and session_key is None)
+                    or (task_id is not None and s.task_id == task_id)
+                    or (session_key is not None and s.session_key == session_key)
+                )
             ]
         return sum(
             self.kill_process(s.id, source=source, consume_output=consume_output).get("status")

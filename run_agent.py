@@ -928,7 +928,7 @@ class AIAgent(
         backend (lazy imports keep the core footprint narrow)."""
         def kill_processes() -> None:
             from tools.process_registry import process_registry
-            process_registry.kill_all(task_id=task_id)
+            process_registry.kill_all(task_id=task_id, session_key=self.session_id)
 
         def release_computer_use() -> None:
             from tools.computer_use.tool import release_computer_use_session
