@@ -22,12 +22,18 @@ from agent.deadline import run_bounded_async
 
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
-    text = "" if error is None else str(error)
+    fallback = type(error).__name__ if error is not None else "UnknownError"
+    text = "" if error is None else str(error).strip()
     if not text:
-        return text
+        text = fallback
+    elif text.endswith(":"):
+        text = f"{text} <no details>"
     try:
         from agent.redact import redact_sensitive_text
-        return redact_sensitive_text(text, force=True)
+        safe_text = redact_sensitive_text(text, force=True).strip()
+        if not safe_text:
+            return fallback
+        return f"{safe_text} <no details>" if safe_text.endswith(":") else safe_text
     except Exception:
         return "<telegram error redacted>"
 
@@ -2894,10 +2900,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._disarm_ptb_retry_loop()
                 self._spawn_polling_recovery(loop, self._handle_polling_conflict(error))
             elif self._looks_like_network_error(error):
-                logger.warning("[%s] Telegram network _redact_telegram_error_text(error), scheduling reconnect: %s", self.name, error)
+                logger.warning(
+                    "[%s] Telegram network error, scheduling reconnect: %s",
+                    self.name, _redact_telegram_error_text(error),
+                )
                 self._spawn_polling_recovery(loop, self._handle_polling_network_error(error))
             else:
-                logger.error("[%s] Telegram polling _redact_telegram_error_text(error): %s", self.name, error, exc_info=True)
+                # PTB invokes this outside an exception handler, so exc_info would attach an unrelated
+                # raw traceback. Keep the emitted diagnostic redacted.
+                logger.error("[%s] Telegram polling error: %s", self.name, _redact_telegram_error_text(error))
 
         self._polling_error_callback_ref = _polling_error_callback  # reused by _handle_polling_conflict
         polling_started = await self._start_polling_resilient(
