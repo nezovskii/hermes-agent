@@ -327,6 +327,65 @@ def test_heal_consolidates_existing_forks_to_the_live_copy(fleet, caplog):
         assert store["credential_pool"]["openai"][0]["access_token"] == "sk-static-key"
 
 
+def test_heal_never_discards_only_refresh_token_for_fresher_access_only_root(fleet):
+    """A newer access-only shadow is not a complete OAuth grant."""
+    import base64
+    from agent.credential_pool import load_pool
+
+    def jwt(sub, exp):
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"sub": sub, "exp": exp}).encode()
+        ).rstrip(b"=")
+        return "h." + payload.decode() + ".s"
+
+    root = fleet["root"]
+    now = int(time.time())
+    root_access = jwt("same", now + 7200)
+    profile_access = jwt("same", now + 3600)
+    root_store = json.loads((root / "auth.json").read_text())
+    root_store["credential_pool"]["xai-oauth"] = [{
+        "id": "xai", "auth_type": "oauth", "priority": 0,
+        "source": "manual:device_code", "access_token": root_access,
+    }]
+    root_store["providers"]["xai-oauth"] = {
+        "auth_mode": "oauth_device_code",
+        "tokens": {"access_token": root_access},
+    }
+    (root / "auth.json").write_text(json.dumps(root_store))
+
+    kid = _profile(fleet, "kid")
+    kid_store = {
+        "version": 1,
+        "providers": {"xai-oauth": {
+            "auth_mode": "oauth_device_code",
+            "tokens": {
+                "access_token": profile_access,
+                "refresh_token": "sole-provider-refresh",
+            },
+        }},
+        "credential_pool": {"xai-oauth": [{
+            "id": "xai", "auth_type": "oauth", "priority": 0,
+            "source": "manual:device_code", "access_token": profile_access,
+            "refresh_token": "sole-pool-refresh",
+        }]},
+    }
+    (kid / "auth.json").write_text(json.dumps(kid_store))
+
+    fleet["use"](kid)
+    pool = load_pool("xai-oauth")
+    healed_root = json.loads((root / "auth.json").read_text())
+    rows = healed_root["credential_pool"]["xai-oauth"]
+    provider = healed_root["providers"]["xai-oauth"]
+    assert rows[0]["refresh_token"] == "sole-pool-refresh"
+    assert provider["tokens"]["refresh_token"] == "sole-provider-refresh"
+    assert rows[0]["access_token"] == root_access
+    assert "xai" in [entry.id for entry in pool.entries()]
+    assert pool._borrowed_root_ids
+    healed_kid = json.loads((kid / "auth.json").read_text())
+    assert "xai-oauth" not in healed_kid["credential_pool"]
+    assert "xai-oauth" not in healed_kid["providers"]
+
+
 def test_heal_is_idempotent_and_logs_once(fleet, caplog):
     import logging
     from agent.credential_pool import load_pool

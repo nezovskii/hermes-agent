@@ -221,6 +221,27 @@ def _adopt_oauth_material(target: Dict[str, Any], winner: Dict[str, Any]) -> Dic
     return merged
 
 
+def _preserve_missing_refresh_token(
+    target: Dict[str, Any], source: Dict[str, Any]
+) -> Tuple[Dict[str, Any], bool]:
+    """Carry the sole refresh token without replacing fresher access material.
+
+    A newer access-only shadow is not a complete OAuth grant. Consolidation
+    may retain that access token, but it must retain the only refresh-capable
+    material before removing the profile copy.
+    """
+    target_refresh = target.get("refresh_token")
+    source_refresh = source.get("refresh_token")
+    if (
+        isinstance(target_refresh, str)
+        and target_refresh.strip()
+    ) or not (isinstance(source_refresh, str) and source_refresh.strip()):
+        return target, False
+    merged = dict(target)
+    merged["refresh_token"] = source_refresh
+    return merged, True
+
+
 def _singleton_as_row(path: Path) -> Optional[Dict[str, Any]]:
     """Read a ``.anthropic_oauth.json`` as a pool-row-shaped dict, or None."""
     try:
@@ -259,11 +280,13 @@ def heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str, 
 
 
 def _heal_forked_provider_block(
-    profile_store: Dict[str, Any], root_store: Dict[str, Any], provider_id: str) -> Optional[bool]:
+    profile_store: Dict[str, Any], root_store: Dict[str, Any], provider_id: str
+) -> Optional[Tuple[bool, bool]]:
     """Consolidate a forked ``providers.<id>`` device-code block into root.
 
-    Returns None when nothing matched, False when the profile copy was dropped (root already
-    newest), True when the profile copy was fresher and was adopted into root.
+    Returns ``(adopted, preserved_refresh)`` when a matching profile copy was
+    removed, else None. A fresher access-only root copy can retain its access
+    material while inheriting the profile's sole refresh token.
     """
     p_providers, r_providers = profile_store.get("providers"), root_store.get("providers")
     if not (isinstance(p_providers, dict) and isinstance(r_providers, dict)):
@@ -273,7 +296,7 @@ def _heal_forked_provider_block(
         return None
 
     def _flat(block: Dict[str, Any]) -> Dict[str, Any]:
-        tokens = block.get("tokens") if isinstance(block.get("tokens"), dict) else {}
+        tokens = dict(block.get("tokens")) if isinstance(block.get("tokens"), dict) else {}
         return {**tokens, "last_refresh": block.get("last_refresh")}
 
     p_flat, r_flat = _flat(p_block), _flat(r_block)
@@ -281,10 +304,23 @@ def _heal_forked_provider_block(
     if p_ident and r_ident and p_ident != r_ident:
         return None
     adopted = _oauth_freshness(p_flat) > _oauth_freshness(r_flat)
+    preserved_refresh = False
     if adopted:
         r_providers[provider_id] = dict(p_block)
+    else:
+        merged_tokens, preserved_refresh = _preserve_missing_refresh_token(
+            r_flat, p_flat
+        )
+        if preserved_refresh:
+            merged_block = dict(r_block)
+            merged_block["tokens"] = {
+                key: value
+                for key, value in merged_tokens.items()
+                if key != "last_refresh"
+            }
+            r_providers[provider_id] = merged_block
     del p_providers[provider_id]
-    return adopted
+    return adopted, preserved_refresh
 
 
 def _mtime_ns(p: Optional[Path]) -> Optional[int]:
@@ -315,7 +351,12 @@ class _HealPass:
         self.profile_store, self.root_store = profile_store, root_store
         self.provider_id = provider_id
         self.summary: Dict[str, Any] = {
-            "adopted": False, "stripped_ids": [], "files": [], "providers_block": False}
+            "adopted": False,
+            "preserved_refresh": False,
+            "stripped_ids": [],
+            "files": [],
+            "providers_block": False,
+        }
         self.profile_changed = self.root_changed = False
         self.p_pool, self.p_rows = _pool_rows(profile_store, provider_id)
         self.r_pool, self.r_rows = _pool_rows(root_store, provider_id)
@@ -330,6 +371,11 @@ class _HealPass:
         if merged is not None:
             self.r_rows[idx] = merged
             self.root_changed = self.summary["adopted"] = True
+            return
+        merged, preserved = _preserve_missing_refresh_token(self.r_rows[idx], row)
+        if preserved:
+            self.r_rows[idx] = merged
+            self.root_changed = self.summary["preserved_refresh"] = True
 
     def _adopt_root_singleton(self, row: Dict[str, Any]) -> None:
         merged = _adopt_if_fresher(self.root_singleton_row, row)
@@ -370,8 +416,11 @@ class _HealPass:
             self.profile_store, self.root_store, self.provider_id)
         if block_result is not None:
             self.profile_changed = self.summary["providers_block"] = True
-            if block_result:
+            adopted, preserved_refresh = block_result
+            if adopted:
                 self.root_changed = self.summary["adopted"] = True
+            elif preserved_refresh:
+                self.root_changed = self.summary["preserved_refresh"] = True
 
     def heal_profile_singleton(self, profile_singleton: Optional[Path]) -> None:
         if profile_singleton is None or not profile_singleton.exists():
@@ -438,7 +487,13 @@ class _HealPass:
             (", ".join(summary["files"]), summary["files"])) if present]
         verdict = (
             "profile copy was the live pair; root updated"
-            if summary["adopted"] else "root copy already newest; profile copy dropped")
+            if summary["adopted"]
+            else (
+                "root kept newer access and recovered missing refresh token"
+                if summary["preserved_refresh"]
+                else "root copy already newest; profile copy dropped"
+            )
+        )
         return (
             f"profile {profile_name}: consolidated forked {self.provider_id} OAuth grant "
             f"({'; '.join(log_bits) or 'no-op'}) into the root grant — {verdict}; "
