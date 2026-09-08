@@ -568,6 +568,70 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
 
+    def test_blocks_python_subprocess_argv_loaded_from_json(
+        self, monkeypatch, tmp_path
+    ):
+        """A gateway agent must not launder a blocked launchctl command through
+        a JSON argv file and ``subprocess.check_call(json.load(open(...)))``.
+
+        Pattern-Key: gateway-lifecycle-file-backed-argv-bypass.
+        """
+        import tools.terminal_tool as tt
+
+        argv = tmp_path / "restart-default-argv.json"
+        argv.write_text(
+            json.dumps(
+                [
+                    "/bin/launchctl",
+                    "kickstart",
+                    "-k",
+                    "gui/501/ai.hermes.gateway",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+
+        command = (
+            "/usr/bin/python3 -c "
+            f"'import json,subprocess; subprocess.check_call(json.load(open(\"{argv}\")))'"
+        )
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 1
+        assert "referenced script" in result["error"]
+
+    def test_allows_safe_python_subprocess_argv_loaded_from_json(
+        self, monkeypatch, tmp_path
+    ):
+        import tools.terminal_tool as tt
+
+        argv = tmp_path / "safe-argv.json"
+        argv.write_text(json.dumps(["/bin/echo", "healthy"]), encoding="utf-8")
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, cmd, **kwargs):
+                calls.append(cmd)
+                return {"output": "healthy\n", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+        command = (
+            "/usr/bin/python3 -c "
+            f"'import json,subprocess; subprocess.check_call(json.load(open(\"{argv}\")))'"
+        )
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls[-1] == command
+        assert calls.count(command) == 1
+
     def test_blocks_launchctl_submit_inside_gateway(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
 

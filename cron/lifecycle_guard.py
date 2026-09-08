@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import stat
+from itertools import chain
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
@@ -110,6 +111,14 @@ _HERMES_GATEWAY_LABEL_RE = re.compile(r"(?i)\bhermes[.\-]?gateway\b")
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
 _SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
 _SHELL_COMMAND_FLAGS = {"-c", "--command"}
+_PYTHON_EXECUTABLE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|pypy(?:\d+)?)$")
+_PYTHON_SUBPROCESS_SINK = re.compile(
+    r"\b(?:subprocess\.(?:run|call|check_call|check_output|Popen)|"
+    r"os\.(?:system|popen|exec\w*|spawn\w*))\b"
+)
+_PYTHON_JSON_LOAD_OPEN = re.compile(
+    r"\bjson\.load\s*\(\s*open\s*\(\s*(['\"])(?P<path>[^'\"]+)\1"
+)
 _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
@@ -765,6 +774,33 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
                 break
 
 
+def _iter_python_file_backed_argv(command: str, *, cwd: Optional[str]) -> Iterator[Path]:
+    """Yield JSON files whose loaded value is handed to a Python process sink.
+
+    A supervised-gateway agent can otherwise hide a blocked argv list in JSON and execute it with
+    ``subprocess.check_call(json.load(open(path)))``. The shell command contains neither the
+    lifecycle verb nor label, so direct and referenced-shell scans both miss it. Keep this narrow:
+    require an executed Python ``-c`` payload, a concrete subprocess/OS execution sink, and a
+    literal ``json.load(open(...))`` path before reading anything.
+
+    Pattern-Key: gateway-lifecycle-file-backed-argv-bypass.
+    """
+    for segment in _iter_command_segments(command):
+        index = _executed_command_index(segment)
+        if index is None or not _PYTHON_EXECUTABLE.fullmatch(_executable_name(segment[index])):
+            continue
+        arguments = segment[index + 1 :]
+        for arg_index, argument in enumerate(arguments[:-1]):
+            if argument not in {"-c", "--command"}:
+                continue
+            payload = arguments[arg_index + 1]
+            if not _PYTHON_SUBPROCESS_SINK.search(payload):
+                break
+            for match in _PYTHON_JSON_LOAD_OPEN.finditer(payload):
+                yield from _resolved_or_nothing(match.group("path"), cwd)
+            break
+
+
 # --- referenced-script reading ----------------------------------------------------------------
 
 def _has_binary_magic(data: bytes) -> bool:
@@ -903,7 +939,10 @@ def _contains_unsafe_gateway_action(
         if recurse(payload, cwd):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    for script_path in chain(
+        _iter_referenced_shell_scripts(command, cwd=cwd),
+        _iter_python_file_backed_argv(command, cwd=cwd),
+    ):
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
         if _on_cloud_path(script_path):
             return True
