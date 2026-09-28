@@ -14,6 +14,7 @@ Covers the three seams the integration relies on:
 import json
 import os
 import stat
+import subprocess
 import time
 
 import pytest
@@ -922,6 +923,103 @@ class TestBrowserExec:
         monkeypatch.setattr(bu_cli, "_MIN_TIMEOUT_S", 1)
         result = json.loads(bu_cli.browser_exec("print(1)", timeout_s=1))
         assert "timed out" in result["error"]
+
+    @pytest.mark.parametrize("scope,owned", [("auto", True), ("task", True), ("persistent", False)])
+    def test_private_session_scope_ownership(self, scope, owned, tmp_path, monkeypatch):
+        from tools import browser_use_lifecycle as lifecycle
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\nprintf "%s" "$BH_RUNTIME_DIR"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        task, session = "scope-task-" + scope, "scope-session-" + scope
+        result = json.loads(bu_cli.browser_exec("print(1)", session=session,
+                            task_id=task, session_scope=scope))
+        assert result["success"] is True
+        assert ((task, session) in lifecycle._leases) is owned
+        lifecycle.release_task_sessions(task)
+        assert (task, session) not in lifecycle._leases
+
+    def test_invalid_scope_rejected_before_backend_allocation(self, monkeypatch):
+        monkeypatch.setattr(bu_cli, "_route_backend", lambda *args: pytest.fail("allocated invalid scope"))
+        result = json.loads(bu_cli.browser_exec("print(1)", session_scope="invalid"))
+        assert "Invalid session_scope" in result["error"]
+
+    def test_auto_preserves_shared_cdp(self, tmp_path, monkeypatch):
+        from tools import browser_use_lifecycle as lifecycle
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho shared\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "http://127.0.0.1:9222")
+        result = json.loads(bu_cli.browser_exec("print(1)", session="shared-auto", task_id="shared-task"))
+        assert result["success"] is True
+        assert ("shared-task", "shared-auto") not in lifecycle._leases
+
+    def test_task_scope_is_private_and_persists_until_task_cleanup(self, tmp_path, monkeypatch):
+        from tools import browser_use_lifecycle as lifecycle
+
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\nprintf "%s" "$BH_RUNTIME_DIR"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        result = json.loads(bu_cli.browser_exec(
+            "print(1)", session="owned-task-scope", session_scope="task", task_id="task-a",
+        ))
+        assert result["success"] is True
+        assert "browser-use" not in result["output"]  # never the vendor shared runtime
+        assert result["output"].strip()
+
+        # A completed subprocess does not release a task-owned browser: another call
+        # in the same task may reuse it, while a concurrent task cannot take the name.
+        other, error = lifecycle.acquire_task_session("task-b", "owned-task-scope")
+        assert other is None and error is not None
+        lifecycle.release_task_sessions("task-a")
+        replacement, error = lifecycle.acquire_task_session("task-b", "owned-task-scope")
+        assert error is None and replacement is not None
+        lifecycle.release_task_sessions("task-b")
+        lifecycle.release_call(replacement)
+
+    def test_task_scope_rejects_shared_cdp_and_leaves_no_lease(self, tmp_path, monkeypatch):
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho should-not-run\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "http://127.0.0.1:9222")
+
+        result = json.loads(bu_cli.browser_exec(
+            "print(1)", session="owned", session_scope="task", task_id="task-a",
+        ))
+
+        assert "shared Chrome" in result["error"]
+
+    def test_task_scope_timeout_releases_only_at_task_finalizer(self, tmp_path, monkeypatch):
+        from tools import browser_use_lifecycle as lifecycle
+
+        cli = _fake_cli(tmp_path, "cat > /dev/null\nsleep 30\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr(bu_cli, "_MIN_TIMEOUT_S", 1)
+        monkeypatch.setattr(
+            bu_cli.subprocess, "run",
+            lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired(args[0], kwargs["timeout"])),
+        )
+        result = json.loads(bu_cli.browser_exec(
+            "print(1)", session="timeout-owned", session_scope="task", task_id="task-timeout", timeout_s=1,
+        ))
+        assert "timed out" in result["error"]
+        blocked, error = lifecycle.acquire_task_session("task-other", "timeout-owned")
+        assert blocked is None and error is not None
+        lifecycle.release_task_sessions("task-timeout")
+        acquired, error = lifecycle.acquire_task_session("task-other", "timeout-owned")
+        assert acquired is not None and error is None
+        lifecycle.release_task_sessions("task-other")
+        lifecycle.release_call(acquired)
+
+    def test_task_scope_nonzero_error_releases_at_task_finalizer(self, tmp_path, monkeypatch):
+        from tools import browser_use_lifecycle as lifecycle
+
+        cli = _fake_cli(tmp_path, "cat > /dev/null\nexit 3\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        result = json.loads(bu_cli.browser_exec(
+            "print(1)", session="error-owned", session_scope="task", task_id="task-error",
+        ))
+        assert result["success"] is False
+        lifecycle.release_task_sessions("task-error")
+        acquired, error = lifecycle.acquire_task_session("task-other", "error-owned")
+        assert acquired is not None and error is None
+        lifecycle.release_task_sessions("task-other")
+        lifecycle.release_call(acquired)
 
 
 class TestFindCliManagedBin:

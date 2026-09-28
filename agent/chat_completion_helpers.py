@@ -2365,6 +2365,17 @@ def cleanup_task_resources(agent, task_id: str) -> None:
             if agent.verbose_logging:
                 logger.warning("Failed to cleanup %s for task %s: %s", label, task_id, e)
 
+    # Browser Use task leases are ownership-scoped and separate from browser_tool's idle
+    # reaper. This exact per-task finalizer is reached on normal completion,
+    # timeout, cancellation, and tool-loop errors; persistent/default Browser
+    # Use sessions have no lease and remain untouched.
+    try:
+        from tools.browser_use_lifecycle import release_task_sessions
+        release_task_sessions(task_id)
+    except Exception as e:
+        if agent.verbose_logging:
+            logger.warning("Failed to release Browser Use task sessions for %s: %s", task_id, e)
+
 
 def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, usage_obj, *,
     dropped_tool_names=None):

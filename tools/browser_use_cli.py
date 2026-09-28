@@ -517,7 +517,8 @@ def _clamp_timeout(timeout_s: Any) -> int:
 
 
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
-                 task_id: Optional[str] = None, local: bool = False):
+                 task_id: Optional[str] = None, local: bool = False,
+                 session_scope: str = "auto"):
     """Run Python code through the browser-use CLI, and return its output"""
     from tools.registry import tool_error, tool_result
     if not code or not code.strip():
@@ -526,6 +527,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     blocked = _blocked_url_in_code(code)
     if blocked:
         return tool_error(blocked)
+
+    session_scope = str(session_scope or "auto").strip().lower()
+    if session_scope not in {"auto", "persistent", "task"}:
+        return tool_error("Invalid session_scope: use 'auto', 'persistent', or 'task'.")
 
     cmd = _find_cli()
     if not cmd:
@@ -549,6 +554,28 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     if session and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
+    # ``auto`` covers ephemeral agent turns without changing the default/shared
+    # browser or an explicitly persistent named session. A task id is supplied by
+    # the normal agent dispatcher; direct/legacy callers without one remain
+    # persistent. Only an exclusive private backend can ever be task-owned.
+    # This preserves personal Chrome/CDP and named persistent workflows while
+    # preventing ordinary private task browsers from leaking after finalization.
+    task_owned = session_scope == "task" or (
+        session_scope == "auto" and bool(task_id) and bool(session) and bool(private_browser)
+    )
+    lease = None
+    if task_owned:
+        if not private_browser:
+            return tool_error("task-scoped Browser Use sessions require a private Hermes or provider browser; "
+                              "they cannot attach to shared Chrome, a CDP override, or a real-profile browser.")
+        from tools.browser_use_lifecycle import acquire_task_session
+        lease, lease_error = acquire_task_session(task_id, session)
+        if lease_error:
+            return tool_error(lease_error)
+        if lease is None:  # defensive: a successful acquisition always returns its lease
+            return tool_error("task Browser Use session lease was not created")
+        env["BH_RUNTIME_DIR"] = str(lease.runtime_dir)
+
     workspace = _workspace_dir(task_id)
     if workspace:
         env["BH_AGENT_WORKSPACE"] = workspace
@@ -561,34 +588,39 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     timeout = _clamp_timeout(timeout_s)
     started = time.time()
     try:
-        proc = subprocess.run(
-            cmd, input=code, capture_output=True, text=True, timeout=timeout, env=env,
-            **_windows_popen_kwargs(),
-        )
-    except subprocess.TimeoutExpired:
-        return tool_error(f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
-                          f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
-                          "append to workspace files — anything already written to the workspace is preserved.")
-    except OSError as e:
-        return tool_error(f"Failed to launch browser-use CLI: {e}")
+        try:
+            proc = subprocess.run(
+                cmd, input=code, capture_output=True, text=True, timeout=timeout, env=env,
+                **_windows_popen_kwargs(),
+            )
+        except subprocess.TimeoutExpired:
+            return tool_error(f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
+                              f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
+                              "append to workspace files — anything already written to the workspace is preserved.")
+        except OSError as e:
+            return tool_error(f"Failed to launch browser-use CLI: {e}")
 
-    result = {"success": proc.returncode == 0, "exit_code": proc.returncode, "output": proc.stdout}
-    if workspace:
-        result["workspace"] = workspace
-    if session:
-        result["session"] = session
-    stderr = (proc.stderr or "").strip()
-    if len(stderr) > _STDERR_CAP_CHARS:
-        stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
-    if stderr:
-        result["stderr"] = stderr
-    screenshot = _find_screenshot(proc.stdout, started)
-    if screenshot:
-        result["screenshot_path"] = screenshot
-        native = _native_screenshot_result(result, screenshot)
-        if native is not None:
-            return native
-    return tool_result(result)
+        result = {"success": proc.returncode == 0, "exit_code": proc.returncode, "output": proc.stdout}
+        if workspace:
+            result["workspace"] = workspace
+        if session:
+            result["session"] = session
+        stderr = (proc.stderr or "").strip()
+        if len(stderr) > _STDERR_CAP_CHARS:
+            stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
+        if stderr:
+            result["stderr"] = stderr
+        screenshot = _find_screenshot(proc.stdout, started)
+        if screenshot:
+            result["screenshot_path"] = screenshot
+            native = _native_screenshot_result(result, screenshot)
+            if native is not None:
+                return native
+        return tool_result(result)
+    finally:
+        if lease is not None:
+            from tools.browser_use_lifecycle import release_call
+            release_call(lease)
 
 
 _HEADER_BASE = (
@@ -684,6 +716,8 @@ BROWSER_EXEC_SCHEMA = {
             "session": {"type": "string", "description": "Named isolated browser session — its own daemon and (on cloud backends) own browser, so concurrent tasks don't share tabs. Reuse the same name on every related call; omit for the shared default session."},
             "timeout_s": {"type": "integer", "default": _DEFAULT_TIMEOUT_S,
                           "description": f"Max seconds to wait for the code to finish (default {_DEFAULT_TIMEOUT_S}, max {_MAX_TIMEOUT_S})."},
+            "session_scope": {"type": "string", "enum": ["auto", "persistent", "task"], "default": "auto",
+                              "description": "auto releases named private-browser sessions at the owning task finalizer; persistent always keeps the session; task requires an exclusive private browser. Shared/user Chrome is never task-owned."},
         },
         "required": ["code"],
     },
@@ -702,7 +736,7 @@ registry.register(
     handler=lambda args, **kw: browser_exec(
         code=args.get("code", ""), session=args.get("session", "") or "",
         timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S), task_id=kw.get("task_id"),
-        local=bool(args.get("local", False)),
+        local=bool(args.get("local", False)), session_scope=args.get("session_scope", "auto"),
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,
