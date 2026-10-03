@@ -947,6 +947,33 @@ class TestSkillViewCollisionDetection:
         assert result["path"] == "creative/sketch/SKILL.md"
         assert "REAL SKETCH SKILL" in result["content"]
 
+    def test_archived_and_category_support_docs_do_not_shadow_real_skill(self, tmp_path):
+        """Legacy-flat lookup must not resurrect archived templates or category support docs.
+
+        Imported capability packs can keep style documents at `.archive/.../templates/apple.md`
+        or `creative/references/styles/apple.md`. Neither is an invocable flat skill.
+        """
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+        _make_skill(local_dir, "apple", category="apple", body="REAL APPLE SKILL")
+        archived = local_dir / ".archive" / "old-design" / "templates" / "apple.md"
+        archived.parent.mkdir(parents=True)
+        archived.write_text("# Archived Apple template\n", encoding="utf-8")
+        category_support = local_dir / "creative" / "references" / "styles" / "apple.md"
+        category_support.parent.mkdir(parents=True)
+        category_support.write_text("# Apple style support\n", encoding="utf-8")
+
+        p1, p2 = self._patch_dirs(local_dir, [external_dir])
+        with p1, p2:
+            raw = skill_view("apple")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["path"] == "apple/apple/SKILL.md"
+        assert "REAL APPLE SKILL" in result["content"]
+
 
     def test_two_externals_same_name_also_refuse(self, tmp_path):
         """Collision detection is symmetric — two external dirs with
