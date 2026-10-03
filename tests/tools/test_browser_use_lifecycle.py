@@ -12,6 +12,8 @@ import pytest
 
 from tools import browser_use_lifecycle as lifecycle
 
+_REAL_RUNTIME_DIR = lifecycle._runtime_dir
+
 
 _HARNESS_PROGRAM = r'''
 import json, os, socket, sys
@@ -225,3 +227,59 @@ def test_missing_harness_releases_lease_without_process_kill(caplog):
     assert not (lease.runtime_dir / "bu.pid").exists()
     replacement, error = lifecycle.acquire_task_session("task-next", "owned-missing")
     assert error is None and replacement is not None
+
+
+def test_release_waits_when_socket_is_gone_but_recorded_daemon_is_still_exiting():
+    lease, error = lifecycle.acquire_task_session("task-exiting", "owned-exiting")
+    assert error is None and lease is not None
+    pid_path = lease.runtime_dir / "bu.pid"
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,pathlib,sys,time; "
+                "p=pathlib.Path(sys.argv[1]); p.write_text(str(os.getpid())); "
+                "time.sleep(1.0); p.unlink()"
+            ),
+            str(pid_path),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 2
+        while not pid_path.exists():
+            if child.poll() is not None or time.monotonic() >= deadline:
+                stderr = child.stderr.read() if child.stderr else ""
+                raise RuntimeError(f"exiting test daemon did not become ready: {stderr}")
+            time.sleep(0.01)
+
+        lifecycle.release_call(lease)
+        lifecycle.release_task_sessions(lease.task_id)
+        child.wait(timeout=2)
+
+        assert child.returncode == 0
+        assert not (lease.runtime_dir / "bu.sock").exists()
+        assert not pid_path.exists()
+        assert not (lease.runtime_dir / "hermes-task-release.json").exists()
+        replacement, error = lifecycle.acquire_task_session("task-next", lease.session)
+        assert error is None and replacement is not None
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=2)
+        if child.stderr:
+            child.stderr.close()
+
+
+def test_long_runtime_path_fallback_does_not_require_posix_getuid(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ("long-home-" + "x" * 120)))
+    monkeypatch.setattr(lifecycle.os, "getuid", None)
+    monkeypatch.setattr(lifecycle.getpass, "getuser", lambda: "windows-user")
+
+    runtime_dir = _REAL_RUNTIME_DIR("task", "session")
+
+    expected_user_key = lifecycle.hashlib.sha256(b"windows-user").hexdigest()[:12]
+    assert runtime_dir.parent == Path(tempfile.gettempdir()) / f"hermes-bu-{expected_user_key}"

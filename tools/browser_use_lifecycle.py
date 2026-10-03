@@ -9,6 +9,7 @@ like a confirmed shutdown.
 from __future__ import annotations
 
 import errno
+import getpass
 import hashlib
 import json
 import logging
@@ -20,6 +21,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
+
+import psutil
 
 from hermes_constants import get_hermes_home
 
@@ -56,7 +59,11 @@ def _runtime_dir(task_id: str, session: str) -> Path:
     # test/profile home can exceed it even though the runtime itself is safe.
     if len(os.fsencode(str(home_path / "bu.sock"))) < 100:
         return home_path
-    return Path(tempfile.gettempdir()) / f"hermes-bu-{os.getuid()}" / digest
+    getuid = getattr(os, "getuid", None)
+    user_key = str(getuid()) if callable(getuid) else hashlib.sha256(
+        getpass.getuser().encode("utf-8")
+    ).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / f"hermes-bu-{user_key}" / digest
 
 
 def _receipt_path(lease: _TaskSessionLease) -> Path:
@@ -184,12 +191,11 @@ def _pid_is_alive(pid: int) -> bool:
     except ChildProcessError:
         pass
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
         return False
-    except PermissionError:
+    except psutil.AccessDenied:
         return True
-    return True
 
 
 def _wait_for_daemon_exit(lease: _TaskSessionLease, expected_pid: int) -> None:
@@ -229,6 +235,14 @@ def _shutdown(lease: _TaskSessionLease) -> None:
     expected_pid = int(pid_path.read_text(encoding="utf-8").strip())
     if expected_pid <= 0:
         raise RuntimeError("Browser Use harness pid record is invalid")
+    # The vendor removes its socket before the daemon process has necessarily
+    # finished exiting. A retry can therefore arrive in that narrow window
+    # after an acknowledged shutdown. Keep the exact recorded PID bound and
+    # wait for all three liveness artifacts instead of treating the vanished
+    # endpoint itself as a new shutdown failure.
+    if not socket_path.exists():
+        _wait_for_daemon_exit(lease, expected_pid)
+        return
     pong = _ipc(socket_path, {"meta": "ping"})
     if pong.get("pong") is not True or pong.get("pid") != expected_pid:
         raise RuntimeError("Browser Use harness did not prove PID identity")
