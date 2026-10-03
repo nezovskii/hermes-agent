@@ -16,7 +16,11 @@ from hermes_constants import get_hermes_home
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
-    EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS, is_skill_support_path as _is_skill_support_path)
+    EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
+    SKILL_SUPPORT_DIRS as _SKILL_SUPPORT_DIRS,
+    is_excluded_skill_path as _is_excluded_skill_path,
+    is_skill_support_path as _is_skill_support_path,
+)
 from tools.skills_tool_setup import (  # noqa: F401
     SkillReadinessStatus, _build_setup_note, _capture_required_environment_variables,
     _get_required_environment_variables, _is_env_var_persisted, _is_remote_env_backend)
@@ -352,7 +356,14 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
         # Legacy flat <name>.md anywhere under the dir; support docs are excluded
         # (they load via file_path and must not shadow real skills sharing the basename).
         for found_md in search_dir.rglob(f"{name}.md"):
-            if found_md.name != "SKILL.md" and not _is_skill_support_path(found_md):
+            try:
+                containing_parts = found_md.relative_to(search_dir).parts[:-1]
+            except ValueError:
+                containing_parts = found_md.parts[:-1]
+            if (found_md.name != "SKILL.md"
+                    and not _is_excluded_skill_path(found_md, root=search_dir)
+                    and not any(part in _SKILL_SUPPORT_DIRS for part in containing_parts)
+                    and not _is_skill_support_path(found_md)):
                 _record(None, found_md)
     return candidates
 
